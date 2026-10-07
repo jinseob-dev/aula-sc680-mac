@@ -1,0 +1,33 @@
+# OEM Windows binaries (proprietary — do not publish)
+sc680-windows/
+tools/capture_app/
+tools/hiddriver_*.dll
+tools/zig/
+tools/tcc/
+tools/portable-git/
+tools/portable-gh/
+tools/hid_proxy/*.dll
+tools/hid_proxy/*.pdb
+tools/hid_proxy/*.obj
+tools/hid_proxy/*.exe
+tools/hid_proxy/*.lib
+tools/hid_proxy/*.exp
+
+# Keep proxy source + scripts
+!tools/hid_proxy/*.c
+!tools/hid_proxy/*.def
+!tools/*.ps1
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vs/
+.idea/
+*.xcuserstate
+xcuserdata/
+DerivedData/
+*.swp
+
+# Local logs / temp
+*.log
+docs/fixtures/capture_boot.log

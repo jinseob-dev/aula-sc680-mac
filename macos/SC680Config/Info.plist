@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>SC680Config</string>
+	<key>CFBundleDisplayName</key>
+	<string>AULA SC680</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.aula.sc680config</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<key>NSHumanReadableCopyright</key>
+	<string>Interoperability client for AULA SC680</string>
+	<key>NSUSBTransactionsUsageDescription</key>
+	<string>SC680Config needs USB access to configure your AULA SC680 mouse.</string>
+</dict>
+</plist>

@@ -1,0 +1,5 @@
+﻿timestamp=2026-10-07T17:01:17.8192430+10:30
+verify_exit=0
+expected=0
+dongle=1D57:FA65
+checks=reject_report06,accept_dpi04,accept_wrapped_rate

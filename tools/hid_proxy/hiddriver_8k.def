@@ -1,0 +1,14 @@
+LIBRARY hiddriver_8k
+EXPORTS
+    Set_VIDPID
+    Set_Device_Version
+    Open_ReportDevice
+    Close_ReportDevice
+    Open_FeatureDevice
+    Close_FeatureDevice
+    WriteUSB
+    ReadUSB
+    GetFeature
+    SetFeature
+    Open_DevMonitor
+    Close_DevMonitor
