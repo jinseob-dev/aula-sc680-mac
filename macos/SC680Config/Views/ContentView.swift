@@ -49,7 +49,12 @@ struct ContentView: View {
                 .padding()
             }
         }
-        .onAppear { store.refreshConnection() }
+        .task {
+            // One-shot connect on first appear; avoid re-opening on every view refresh.
+            if store.connection == .none {
+                store.refreshConnection()
+            }
+        }
     }
 
     private var header: some View {

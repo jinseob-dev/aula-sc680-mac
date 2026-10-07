@@ -51,9 +51,9 @@ struct DPISlot: Identifiable, Equatable, Codable {
             #if canImport(AppKit)
             let ns = NSColor(newValue)
             if let rgb = ns.usingColorSpace(.deviceRGB) {
-                red = rgb.redComponent
-                green = rgb.greenComponent
-                blue = rgb.blueComponent
+                red = Double(rgb.redComponent)
+                green = Double(rgb.greenComponent)
+                blue = Double(rgb.blueComponent)
             }
             #endif
         }
@@ -164,22 +164,46 @@ final class DeviceStore: ObservableObject {
         if profileDocs.isEmpty {
             profileDocs = [snapshotProfile(name: "Profile 1")]
         }
+        transport.onDeviceRemoved = { [weak self] in
+            Task { @MainActor in
+                self?.markDisconnected(reason: "Receiver disconnected")
+            }
+        }
     }
 
     func refreshConnection() {
         do {
-            let id = try transport.openFirstMatching()
+            let id = try ensureOpen(forceReopen: true)
             productName = transport.productName
             connection = (id == SC680DeviceIDs.dongle8K) ? .wireless8K : .wireless
             lastTransport = transport.transportMode.rawValue
             statusText = "Connected: \(productName) (\(id.label)) via \(lastTransport)"
             syncFromDevice()
         } catch {
-            connection = .none
-            productName = ""
-            batteryPercent = nil
-            statusText = error.localizedDescription
+            markDisconnected(reason: error.localizedDescription)
         }
+    }
+
+    /// Keep / re-open the HID session. The previous open path released `IOHIDManager`
+    /// immediately, so Apply could see a dead handle and report "No device".
+    @discardableResult
+    func ensureOpen(forceReopen: Bool = false) throws -> USBIdentity {
+        if transport.isOpen, !forceReopen, let id = transport.identity {
+            return id
+        }
+        let id = try transport.openFirstMatching()
+        productName = transport.productName
+        connection = (id == SC680DeviceIDs.dongle8K) ? .wireless8K : .wireless
+        lastTransport = transport.transportMode.rawValue
+        return id
+    }
+
+    private func markDisconnected(reason: String) {
+        connection = .none
+        productName = ""
+        batteryPercent = nil
+        lastTransport = ""
+        statusText = reason
     }
 
     func syncFromDevice() {
@@ -224,11 +248,8 @@ final class DeviceStore: ObservableObject {
     }
 
     func applyAll() {
-        guard transport.isOpen else {
-            statusText = "No device"
-            return
-        }
         do {
+            try ensureOpen()
             try sendUnlock()
             try applyDPI()
             try applyPolling()
@@ -238,11 +259,16 @@ final class DeviceStore: ObservableObject {
             persistActiveProfile()
             statusText = "Applied configuration to device"
         } catch {
-            statusText = error.localizedDescription
+            if !transport.isOpen {
+                markDisconnected(reason: error.localizedDescription)
+            } else {
+                statusText = error.localizedDescription
+            }
         }
     }
 
     func applyDPI() throws {
+        try ensureOpen()
         let values = dpiSlots.map(\.dpi)
         var mask: UInt8 = 0
         for (i, slot) in dpiSlots.enumerated() where slot.enabled && i < 8 {
@@ -257,12 +283,14 @@ final class DeviceStore: ObservableObject {
     }
 
     func applyPolling() throws {
+        try ensureOpen()
         let packet = BekenCodec.encodeRate(hz: pollingRate)
         try transport.sendBekenPacket(packet)
         Thread.sleep(forTimeInterval: 0.08)
     }
 
     func applyParams() throws {
+        try ensureOpen()
         let packet = BekenCodec.encodeParams(
             debounceMs: Int(debounceMs),
             angleSnap: angleSnap,
@@ -274,6 +302,7 @@ final class DeviceStore: ObservableObject {
     }
 
     func applyButtons() throws {
+        try ensureOpen()
         // Hardware order: Left, Right, Middle, DPI, Back, Forward, ...
         var actions = [UInt8](repeating: 0x01, count: 18)
         let uiToHw = [0, 1, 2, 5, 4, 3, 2] // map 7 UI buttons → hw slots
@@ -288,6 +317,7 @@ final class DeviceStore: ObservableObject {
     }
 
     func applyLight() throws {
+        try ensureOpen()
         // Light is OEM-extended; send as param-adjacent vendor packet using report 0x05 spare / dedicated light write.
         // SC680 UI stores mode/brightness/speed/color — encode into a 64-byte vendor frame used by many BK3633 mice.
         var buf = [UInt8](repeating: 0, count: 16)
@@ -304,10 +334,11 @@ final class DeviceStore: ObservableObject {
             buf[8] = UInt8(clamping: Int(rgb.blueComponent * 255))
         }
         buf[9] = buf[3] &+ buf[4] &+ buf[5] &+ buf[6] &+ buf[7] &+ buf[8]
-        try? transport.sendBekenPacket(Data(buf))
+        try transport.sendBekenPacket(Data(buf))
     }
 
     func sendUnlock() throws {
+        try ensureOpen()
         for packet in BekenCodec.unlockPackets() {
             try transport.sendBekenPacket(packet)
             Thread.sleep(forTimeInterval: 0.05)
@@ -395,9 +426,9 @@ final class DeviceStore: ObservableObject {
             lightMode: lightMode.rawValue,
             lightBrightness: lightBrightness,
             lightSpeed: lightSpeed,
-            lightRed: rgb?.redComponent ?? 1,
-            lightGreen: rgb?.greenComponent ?? 0,
-            lightBlue: rgb?.blueComponent ?? 0,
+            lightRed: Double(rgb?.redComponent ?? 1),
+            lightGreen: Double(rgb?.greenComponent ?? 0),
+            lightBlue: Double(rgb?.blueComponent ?? 0),
             sleepMinutes: sleepMinutes,
             moveWake: moveWake,
             lodMM: lodMM,

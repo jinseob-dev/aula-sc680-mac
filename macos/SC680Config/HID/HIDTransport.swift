@@ -21,12 +21,20 @@ enum TransportMode: String {
 }
 
 /// IOHIDDevice wrapper with Feature-first + 8K Output fallback.
+///
+/// Important: the `IOHIDManager` that enumerated the device must stay alive for
+/// as long as we use the device. Releasing it early closes the handle and leaves
+/// UI state looking "connected" while `isOpen` becomes false on the next use.
 final class HIDTransport {
+    private var manager: IOHIDManager?
     private var device: IOHIDDevice?
     private(set) var identity: USBIdentity?
     private(set) var productName: String = ""
     private(set) var transportMode: TransportMode = .feature
     private(set) var usagePage: Int = 0
+
+    /// Called on the main queue when the open device is removed.
+    var onDeviceRemoved: (() -> Void)?
 
     var isOpen: Bool { device != nil }
 
@@ -34,7 +42,12 @@ final class HIDTransport {
         if let device {
             IOHIDDeviceClose(device, IOOptionBits(kIOHIDOptionsTypeNone))
         }
+        if let manager {
+            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
         device = nil
+        manager = nil
         identity = nil
         productName = ""
         usagePage = 0
@@ -45,17 +58,20 @@ final class HIDTransport {
     @discardableResult
     func openFirstMatching() throws -> USBIdentity {
         close()
-        let manager = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        IOHIDManagerSetDeviceMatching(manager, nil)
-        IOHIDManagerOpen(manager, IOOptionBits(kIOHIDOptionsTypeNone))
-        guard let set = IOHIDManagerCopyDevices(manager) as? Set<IOHIDDevice> else {
+
+        let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
+        IOHIDManagerSetDeviceMatching(mgr, nil)
+        let openKr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+        guard openKr == kIOReturnSuccess else {
+            throw HIDTransportError.openFailed
+        }
+
+        guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
+            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             throw HIDTransportError.deviceNotFound
         }
 
-        // Prefer 8K dongle vendor page, then standard dongle vendor pages.
-        let ranked = set.sorted { a, b in
-            score(a) > score(b)
-        }
+        let ranked = set.sorted { score($0) > score($1) }
 
         for candidate in ranked {
             let vid = intProperty(candidate, kIOHIDVendorIDKey)
@@ -71,14 +87,41 @@ final class HIDTransport {
                 || IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess
             guard opened else { continue }
 
+            // Keep manager alive for the lifetime of this open session.
+            manager = mgr
             device = candidate
             identity = match
             usagePage = page
             productName = stringProperty(candidate, kIOHIDProductKey) ?? match.label
             transportMode = (match == SC680DeviceIDs.dongle8K) ? .output8K : .feature
+
+            IOHIDManagerRegisterDeviceRemovalCallback(mgr, { context, _, _, _ in
+                guard let context else { return }
+                let transport = Unmanaged<HIDTransport>.fromOpaque(context).takeUnretainedValue()
+                DispatchQueue.main.async {
+                    transport.handleRemoval()
+                }
+            }, Unmanaged.passUnretained(self).toOpaque())
+            IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+
             return match
         }
+
+        IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
         throw HIDTransportError.deviceNotFound
+    }
+
+    private func handleRemoval() {
+        device = nil
+        if let manager {
+            IOHIDManagerUnscheduleFromRunLoop(manager, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+            IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
+        }
+        manager = nil
+        identity = nil
+        productName = ""
+        usagePage = 0
+        onDeviceRemoved?()
     }
 
     /// Send a Beken packet using the best transport for the connected dongle.
