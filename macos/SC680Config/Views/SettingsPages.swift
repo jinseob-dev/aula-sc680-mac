@@ -61,9 +61,19 @@ struct DPISettingsView: View {
             }
             Section {
                 Button("Apply DPI") {
-                    do { try store.sendUnlock(); try store.applyDPI(); store.statusText = "DPI applied" }
-                    catch { store.statusText = error.localizedDescription }
+                    do {
+                        try store.sendUnlock()
+                        Thread.sleep(forTimeInterval: 0.2)
+                        try store.ensureOpen(forceReopen: false)
+                        try store.applyDPI()
+                        store.statusText = "DPI applied (stage \(store.activeDPIIndex + 1), \(store.dpiSlots[store.activeDPIIndex].dpi))"
+                    } catch {
+                        store.statusText = error.localizedDescription
+                    }
                 }
+                Text("Uses the confirmed 8K Output report 0x04 (64 bytes), same as Windows WriteUSB.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
