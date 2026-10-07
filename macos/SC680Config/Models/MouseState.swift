@@ -351,22 +351,52 @@ final class DeviceStore: ObservableObject {
     }
 
     func applyLight() throws {
-        try performTransfer {
-            var buf = [UInt8](repeating: 0, count: 16)
-            buf[0] = 0x07
-            buf[1] = 0x0A
-            buf[2] = 0x01
-            buf[3] = lightMode.oemCode
-            buf[4] = UInt8(clamping: Int(lightBrightness))
-            buf[5] = UInt8(clamping: Int(lightSpeed))
-            let ns = NSColor(lightColor)
-            if let rgb = ns.usingColorSpace(.deviceRGB) {
-                buf[6] = UInt8(clamping: Int(rgb.redComponent * 255))
-                buf[7] = UInt8(clamping: Int(rgb.greenComponent * 255))
-                buf[8] = UInt8(clamping: Int(rgb.blueComponent * 255))
+        // Persist locally even if the dongle rejects the OEM light frame.
+        persistActiveProfile()
+
+        var red: UInt8 = 255, green: UInt8 = 0, blue: UInt8 = 0
+        let ns = NSColor(lightColor)
+        if let rgb = ns.usingColorSpace(.deviceRGB) {
+            red = UInt8(clamping: Int(rgb.redComponent * 255))
+            green = UInt8(clamping: Int(rgb.greenComponent * 255))
+            blue = UInt8(clamping: Int(rgb.blueComponent * 255))
+        }
+        let brightness = UInt8(clamping: Int(lightBrightness))
+        let speed = UInt8(clamping: Int(lightSpeed))
+        let frames = BekenCodec.encodeLightFrames(
+            mode: lightMode.oemCode,
+            brightness: brightness,
+            speed: speed,
+            red: red,
+            green: green,
+            blue: blue
+        )
+
+        var lastError: Error?
+        try ensureOpen()
+        for frame in frames {
+            do {
+                if frame.first == BekenCodec.dpiReportID, frame.count == BekenCodec.outputLength8K {
+                    try transport.send8KOutput(frame)
+                } else {
+                    try transport.sendBekenPacket(frame)
+                }
+                Thread.sleep(forTimeInterval: 0.08)
+                statusText = "Light applied (\(lightMode.rawValue))"
+                return
+            } catch {
+                lastError = error
+                // USB blip — reopen once and try next frame shape.
+                Thread.sleep(forTimeInterval: 0.2)
+                _ = try? ensureOpen(forceReopen: true)
             }
-            buf[9] = buf[3] &+ buf[4] &+ buf[5] &+ buf[6] &+ buf[7] &+ buf[8]
-            try transport.sendBekenPacket(Data(buf))
+        }
+
+        // Do not surface setFeature 0xE0005000 for unsupported legacy light reports.
+        statusText = "Light saved in profile — effect may be unsupported on this 8K firmware"
+        if let lastError {
+            // Keep detail available for debugging without looking like a hard failure.
+            NSLog("SC680Config applyLight: %@", String(describing: lastError))
         }
     }
 
