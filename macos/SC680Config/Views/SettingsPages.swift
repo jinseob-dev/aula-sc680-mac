@@ -71,7 +71,7 @@ struct DPISettingsView: View {
                         store.statusText = error.localizedDescription
                     }
                 }
-                Text("Uses the confirmed 8K Output report 0x04 (64 bytes), same as Windows WriteUSB.")
+                Text("No Mac reboot needed. After Apply: press the mouse DPI button to cycle stages, or power-cycle the mouse. Transport should show output8K+feature.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }

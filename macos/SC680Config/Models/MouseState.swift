@@ -181,7 +181,12 @@ final class DeviceStore: ObservableObject {
             productName = transport.productName
             connection = (id == SC680DeviceIDs.dongle8K) ? .wireless8K : .wireless
             lastTransport = transport.transportMode.rawValue
+            let paths = [
+                transport.hasOutputPath ? "Out" : nil,
+                transport.hasFeaturePath ? "Feat" : nil,
+            ].compactMap { $0 }.joined(separator: "+")
             statusText = "Connected: \(productName) (\(id.label)) via \(lastTransport)"
+                + (paths.isEmpty ? "" : " [\(paths)]")
             syncFromDevice()
         } catch {
             markDisconnected(reason: error.localizedDescription)
@@ -329,6 +334,18 @@ final class DeviceStore: ObservableObject {
             }
             Thread.sleep(forTimeInterval: 0.08)
             try sendApplyCommit()
+
+            // Verify: read DPI back when Feature path exists.
+            if transport.hasFeaturePath,
+               let raw = try? transport.readBekenPacket(reportID: BekenCodec.dpiReportID, length: 52),
+               let decoded = BekenCodec.decodeDPI(raw) {
+                let expected = values[min(activeDPIIndex, values.count - 1)]
+                let got = decoded.slots.indices.contains(decoded.activeIndex)
+                    ? decoded.slots[decoded.activeIndex] : -1
+                if got > 0, abs(got - expected) > 50 {
+                    statusText = "DPI write sent but device reports \(got) (wanted \(expected)) — press mouse DPI button / power-cycle mouse"
+                }
+            }
         }
     }
 
@@ -437,15 +454,16 @@ final class DeviceStore: ObservableObject {
 
     func sendUnlock() throws {
         try ensureOpen()
-        // Unlock must not block DPI on 8K: Feature 0x80 often returns 0xE0005000
-        // on the Output-only interface. Prefer wrapped Output; ignore failures.
+        // Windows: SetFeature unlock on Feature device, then WriteUSB config on Report device.
+        // Without Feature unlock, Output writes can "succeed" but the mouse ignores them.
+        if transport.hasFeaturePath {
+            try transport.sendFeatureUnlock()
+            return
+        }
+        // Fallback: wrapped Output unlock (may be ignored by firmware).
         for packet in BekenCodec.unlockPackets() {
             do {
-                if transport.identity == SC680DeviceIDs.dongle8K || transport.transportMode == .output8K {
-                    try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
-                } else {
-                    try transport.sendBekenPacket(packet)
-                }
+                try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
             } catch {
                 NSLog("SC680Config unlock soft-fail: %@", String(describing: error))
             }
