@@ -166,7 +166,11 @@ final class DeviceStore: ObservableObject {
         }
         transport.onDeviceRemoved = { [weak self] in
             Task { @MainActor in
-                self?.markDisconnected(reason: "Receiver disconnected")
+                // Soft UI mark only — Apply retries reopen after USB resets.
+                guard let self else { return }
+                if self.connection != .none {
+                    self.statusText = "Receiver reset — reconnecting…"
+                }
             }
         }
     }
@@ -184,18 +188,42 @@ final class DeviceStore: ObservableObject {
         }
     }
 
-    /// Keep / re-open the HID session. The previous open path released `IOHIDManager`
-    /// immediately, so Apply could see a dead handle and report "No device".
+    /// Keep / re-open the HID session.
     @discardableResult
     func ensureOpen(forceReopen: Bool = false) throws -> USBIdentity {
         if transport.isOpen, !forceReopen, let id = transport.identity {
             return id
         }
-        let id = try transport.openFirstMatching()
-        productName = transport.productName
-        connection = (id == SC680DeviceIDs.dongle8K) ? .wireless8K : .wireless
-        lastTransport = transport.transportMode.rawValue
-        return id
+        // USB reset after unlock/write: wait briefly then reopen.
+        var lastError: Error = HIDTransportError.openFailed("unknown")
+        for attempt in 0..<4 {
+            if attempt > 0 {
+                Thread.sleep(forTimeInterval: 0.25 * Double(attempt))
+            }
+            do {
+                let id = try transport.openFirstMatching()
+                productName = transport.productName
+                connection = (id == SC680DeviceIDs.dongle8K) ? .wireless8K : .wireless
+                lastTransport = transport.transportMode.rawValue
+                return id
+            } catch {
+                lastError = error
+            }
+        }
+        throw lastError
+    }
+
+    /// Run a HID write, reopening once if the session dropped mid-transfer.
+    private func performTransfer(_ body: () throws -> Void) throws {
+        try ensureOpen()
+        do {
+            try body()
+        } catch {
+            // Dongle often re-enumerates after unlock / rate changes.
+            Thread.sleep(forTimeInterval: 0.35)
+            try ensureOpen(forceReopen: true)
+            try body()
+        }
     }
 
     private func markDisconnected(reason: String) {
@@ -249,8 +277,11 @@ final class DeviceStore: ObservableObject {
 
     func applyAll() {
         do {
-            try ensureOpen()
+            try ensureOpen(forceReopen: true)
             try sendUnlock()
+            // Unlock can reset the 8K radio — reopen before commits.
+            Thread.sleep(forTimeInterval: 0.4)
+            try ensureOpen(forceReopen: true)
             try applyDPI()
             try applyPolling()
             try applyParams()
@@ -259,89 +290,92 @@ final class DeviceStore: ObservableObject {
             persistActiveProfile()
             statusText = "Applied configuration to device"
         } catch {
+            statusText = error.localizedDescription
             if !transport.isOpen {
-                markDisconnected(reason: error.localizedDescription)
-            } else {
-                statusText = error.localizedDescription
+                connection = .none
             }
         }
     }
 
     func applyDPI() throws {
-        try ensureOpen()
-        let values = dpiSlots.map(\.dpi)
-        var mask: UInt8 = 0
-        for (i, slot) in dpiSlots.enumerated() where slot.enabled && i < 8 {
-            mask |= 1 << i
+        try performTransfer {
+            let values = dpiSlots.map(\.dpi)
+            var mask: UInt8 = 0
+            for (i, slot) in dpiSlots.enumerated() where slot.enabled && i < 8 {
+                mask |= 1 << i
+            }
+            let colors: [(UInt8, UInt8, UInt8)] = dpiSlots.map {
+                (UInt8(clamping: Int($0.red * 255)), UInt8(clamping: Int($0.green * 255)), UInt8(clamping: Int($0.blue * 255)))
+            }
+            let packet = BekenCodec.encodeDPI(slots: values, activeIndex: activeDPIIndex, colors: colors, enabledMask: mask == 0 ? 0x1F : mask)
+            try transport.sendBekenPacket(packet)
+            Thread.sleep(forTimeInterval: 0.08)
         }
-        let colors: [(UInt8, UInt8, UInt8)] = dpiSlots.map {
-            (UInt8(clamping: Int($0.red * 255)), UInt8(clamping: Int($0.green * 255)), UInt8(clamping: Int($0.blue * 255)))
-        }
-        let packet = BekenCodec.encodeDPI(slots: values, activeIndex: activeDPIIndex, colors: colors, enabledMask: mask == 0 ? 0x1F : mask)
-        try transport.sendBekenPacket(packet)
-        Thread.sleep(forTimeInterval: 0.08)
     }
 
     func applyPolling() throws {
-        try ensureOpen()
-        let packet = BekenCodec.encodeRate(hz: pollingRate)
-        try transport.sendBekenPacket(packet)
-        Thread.sleep(forTimeInterval: 0.08)
+        try performTransfer {
+            let packet = BekenCodec.encodeRate(hz: pollingRate)
+            try transport.sendBekenPacket(packet)
+            Thread.sleep(forTimeInterval: 0.08)
+        }
     }
 
     func applyParams() throws {
-        try ensureOpen()
-        let packet = BekenCodec.encodeParams(
-            debounceMs: Int(debounceMs),
-            angleSnap: angleSnap,
-            ripple: rippleControl,
-            motionSync: motionSync
-        )
-        try transport.sendBekenPacket(packet)
-        Thread.sleep(forTimeInterval: 0.08)
+        try performTransfer {
+            let packet = BekenCodec.encodeParams(
+                debounceMs: Int(debounceMs),
+                angleSnap: angleSnap,
+                ripple: rippleControl,
+                motionSync: motionSync
+            )
+            try transport.sendBekenPacket(packet)
+            Thread.sleep(forTimeInterval: 0.08)
+        }
     }
 
     func applyButtons() throws {
-        try ensureOpen()
-        // Hardware order: Left, Right, Middle, DPI, Back, Forward, ...
-        var actions = [UInt8](repeating: 0x01, count: 18)
-        let uiToHw = [0, 1, 2, 5, 4, 3, 2] // map 7 UI buttons → hw slots
-        for (ui, hw) in uiToHw.enumerated() where ui < buttons.count {
-            actions[hw] = BekenCodec.actionCode(for: buttons[ui].action)
+        try performTransfer {
+            // Hardware order: Left, Right, Middle, DPI, Back, Forward, ...
+            var actions = [UInt8](repeating: 0x01, count: 18)
+            let uiToHw = [0, 1, 2, 5, 4, 3, 2] // map 7 UI buttons → hw slots
+            for (ui, hw) in uiToHw.enumerated() where ui < buttons.count {
+                actions[hw] = BekenCodec.actionCode(for: buttons[ui].action)
+            }
+            actions[16] = BekenCodec.actionCode(for: .scrollUp)
+            actions[17] = BekenCodec.actionCode(for: .scrollDown)
+            let packet = BekenCodec.encodeButtons(actions)
+            try transport.sendBekenPacket(packet)
+            Thread.sleep(forTimeInterval: 0.08)
         }
-        actions[16] = BekenCodec.actionCode(for: .scrollUp)
-        actions[17] = BekenCodec.actionCode(for: .scrollDown)
-        let packet = BekenCodec.encodeButtons(actions)
-        try transport.sendBekenPacket(packet)
-        Thread.sleep(forTimeInterval: 0.08)
     }
 
     func applyLight() throws {
-        try ensureOpen()
-        // Light is OEM-extended; send as param-adjacent vendor packet using report 0x05 spare / dedicated light write.
-        // SC680 UI stores mode/brightness/speed/color — encode into a 64-byte vendor frame used by many BK3633 mice.
-        var buf = [UInt8](repeating: 0, count: 16)
-        buf[0] = 0x07 // light report id used by several BK3633 OEM tools
-        buf[1] = 0x0A
-        buf[2] = 0x01
-        buf[3] = lightMode.oemCode
-        buf[4] = UInt8(clamping: Int(lightBrightness))
-        buf[5] = UInt8(clamping: Int(lightSpeed))
-        let ns = NSColor(lightColor)
-        if let rgb = ns.usingColorSpace(.deviceRGB) {
-            buf[6] = UInt8(clamping: Int(rgb.redComponent * 255))
-            buf[7] = UInt8(clamping: Int(rgb.greenComponent * 255))
-            buf[8] = UInt8(clamping: Int(rgb.blueComponent * 255))
+        try performTransfer {
+            var buf = [UInt8](repeating: 0, count: 16)
+            buf[0] = 0x07
+            buf[1] = 0x0A
+            buf[2] = 0x01
+            buf[3] = lightMode.oemCode
+            buf[4] = UInt8(clamping: Int(lightBrightness))
+            buf[5] = UInt8(clamping: Int(lightSpeed))
+            let ns = NSColor(lightColor)
+            if let rgb = ns.usingColorSpace(.deviceRGB) {
+                buf[6] = UInt8(clamping: Int(rgb.redComponent * 255))
+                buf[7] = UInt8(clamping: Int(rgb.greenComponent * 255))
+                buf[8] = UInt8(clamping: Int(rgb.blueComponent * 255))
+            }
+            buf[9] = buf[3] &+ buf[4] &+ buf[5] &+ buf[6] &+ buf[7] &+ buf[8]
+            try transport.sendBekenPacket(Data(buf))
         }
-        buf[9] = buf[3] &+ buf[4] &+ buf[5] &+ buf[6] &+ buf[7] &+ buf[8]
-        try transport.sendBekenPacket(Data(buf))
     }
 
     func sendUnlock() throws {
-        try ensureOpen()
-        for packet in BekenCodec.unlockPackets() {
-            try transport.sendBekenPacket(packet)
-            Thread.sleep(forTimeInterval: 0.05)
+        try performTransfer {
+            for packet in BekenCodec.unlockPackets() {
+                try transport.sendBekenPacket(packet)
+                Thread.sleep(forTimeInterval: 0.08)
+            }
         }
     }
 
