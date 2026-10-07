@@ -1,0 +1,43 @@
+name: macOS installer
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-dmg:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build DMG and ZIP
+        working-directory: macos
+        env:
+          CODE_SIGN_IDENTITY: "-"
+        run: |
+          chmod +x scripts/make-installer.sh
+          ./scripts/make-installer.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: SC680Config-macos-arm64
+          path: |
+            macos/build/*.dmg
+            macos/build/*.zip
+          if-no-files-found: error
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            macos/build/*.dmg
+            macos/build/*.zip
+          generate_release_notes: true
