@@ -168,36 +168,63 @@ final class HIDTransport {
         onDeviceRemoved?()
     }
 
+    /// Report IDs known to exist as Feature on BK3633 / SC680 paths.
+    private static let featureReportIDs: Set<UInt8> = [0x01, 0x04, 0x05, 0x06, 0x08, 0x0C, 0x80]
+
     /// Send a Beken packet using the best transport for the connected dongle.
     func sendBekenPacket(_ packet: Data) throws {
         guard device != nil else { throw HIDTransportError.openFailed("session closed — tap Rescan") }
+        guard let reportID = packet.first else {
+            throw HIDTransportError.reportFailed("empty packet")
+        }
 
-        // 8K dongle: Output report ID 0x04 is the confirmed WriteUSB path.
-        // Try it first for 8K, then Feature. Other dongles: Feature first.
-        if transportMode == .output8K || identity == SC680DeviceIDs.dongle8K {
+        let is8K = transportMode == .output8K || identity == SC680DeviceIDs.dongle8K
+
+        // 8K: WriteUSB only accepts Output report ID 0x04 (64 bytes). Always try that.
+        // Only fall back to Feature for report IDs the descriptor actually lists —
+        // legacy light report 0x07 yields setFeature 0xE0005000 on this dongle.
+        if is8K {
+            var outputError: Error?
             do {
-                let wrapped = BekenCodec.wrapFor8KOutput(packet)
-                try setOutputReport(wrapped)
+                try setOutputReport(BekenCodec.wrapFor8KOutput(packet))
                 transportMode = .output8K
                 return
             } catch {
-                // fall through to Feature
+                outputError = error
             }
+
+            if Self.featureReportIDs.contains(reportID) {
+                do {
+                    try setFeatureReport(packet)
+                    transportMode = .feature
+                    return
+                } catch {
+                    throw outputError ?? error
+                }
+            }
+            throw outputError ?? HIDTransportError.reportFailed("unsupported report 0x\(String(reportID, radix: 16)) on 8K")
         }
 
+        // Standard / wired: Feature first, Output wrap fallback.
         do {
             try setFeatureReport(packet)
             transportMode = .feature
             return
         } catch {
-            if transportMode == .feature {
-                let wrapped = BekenCodec.wrapFor8KOutput(packet)
-                try setOutputReport(wrapped)
-                transportMode = .output8K
-                return
-            }
-            throw error
+            try setOutputReport(BekenCodec.wrapFor8KOutput(packet))
+            transportMode = .output8K
         }
+    }
+
+    /// Send a pre-sized 64-byte Output report (report ID must be 0x04).
+    func send8KOutput(_ packet: Data) throws {
+        guard device != nil else { throw HIDTransportError.openFailed("session closed — tap Rescan") }
+        var bytes = [UInt8](repeating: 0, count: BekenCodec.outputLength8K)
+        let n = min(packet.count, bytes.count)
+        for i in 0..<n { bytes[i] = packet[i] }
+        bytes[0] = BekenCodec.outputReportID8K
+        try setOutputReport(Data(bytes))
+        transportMode = .output8K
     }
 
     func readBekenPacket(reportID: UInt8, length: Int) throws -> Data {

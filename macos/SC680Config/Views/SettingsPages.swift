@@ -84,9 +84,16 @@ struct LightSettingsView: View {
             LabeledContent("Speed") { Slider(value: $store.lightSpeed, in: 0...100) }
             ColorPicker("Color", selection: $store.lightColor)
             Button("Apply Light") {
-                do { try store.sendUnlock(); try store.applyLight(); store.statusText = "Light applied" }
-                catch { store.statusText = error.localizedDescription }
+                do {
+                    try store.sendUnlock()
+                    try store.applyLight()
+                } catch {
+                    store.statusText = error.localizedDescription
+                }
             }
+            Text("Wheel LED effects are OEM-extended. If Apply does not change the mouse, use DPI tab colors (those are confirmed on SC680).")
+                .font(.caption)
+                .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
     }

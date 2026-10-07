@@ -9,11 +9,15 @@ enum BekenCodec {
     static let batteryReportID: UInt8 = 0x01
     static let applyReportID: UInt8 = 0x0C
     static let unlockReportID: UInt8 = 0x80
+    /// OEM light frames on some BK3633 mice (not always present on 8K dongle Feature list).
+    static let lightReportIDLegacy: UInt8 = 0x07
 
     static let dpiCommand: UInt8 = 0x38
     static let paramCommand: UInt8 = 0x0F
     static let rateCommand: UInt8 = 0x09
     static let buttonCommand: UInt8 = 0x3B
+    /// LED/effect command byte used inside report 0x04 on several SOAI/Beken tools.
+    static let lightCommand: UInt8 = 0x07
 
     static let outputReportID8K: UInt8 = 0x04
     static let outputLength8K = 64
@@ -215,6 +219,52 @@ enum BekenCodec {
         guard data.count >= 7, data[0] == batteryReportID else { return nil }
         let pct = Int(data[6])
         return (0...100).contains(pct) ? pct : nil
+    }
+
+    // MARK: - Light / LED
+
+    /// Build light frames to try on device. Prefer report `0x04` (confirmed on 8K);
+    /// legacy `0x07` Feature is unsupported on the 8K receiver (setFeature 0xE0005000).
+    static func encodeLightFrames(
+        mode: UInt8,
+        brightness: UInt8,
+        speed: UInt8,
+        red: UInt8,
+        green: UInt8,
+        blue: UInt8
+    ) -> [Data] {
+        // A) Native 8K path: report 0x04 + LED command 0x07 (64 bytes)
+        var a = [UInt8](repeating: 0, count: outputLength8K)
+        a[0] = dpiReportID
+        a[1] = lightCommand
+        a[2] = 0x01
+        a[3] = mode
+        a[4] = brightness
+        a[5] = speed
+        a[6] = red
+        a[7] = green
+        a[8] = blue
+        a[9] = mode &+ brightness &+ speed &+ red &+ green &+ blue
+
+        // B) Same payload with command 0x0A (seen in some OEM light frames)
+        var b = a
+        b[1] = 0x0A
+        b[9] = mode &+ brightness &+ speed &+ red &+ green &+ blue
+
+        // C) Legacy short feature-style (wired / non-8K only; wrap for 8K Output)
+        var c = [UInt8](repeating: 0, count: 16)
+        c[0] = lightReportIDLegacy
+        c[1] = 0x0A
+        c[2] = 0x01
+        c[3] = mode
+        c[4] = brightness
+        c[5] = speed
+        c[6] = red
+        c[7] = green
+        c[8] = blue
+        c[9] = mode &+ brightness &+ speed &+ red &+ green &+ blue
+
+        return [Data(a), Data(b), Data(c)]
     }
 
     // MARK: - 8K output wrapping
