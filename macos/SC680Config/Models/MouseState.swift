@@ -51,9 +51,9 @@ struct DPISlot: Identifiable, Equatable, Codable {
             #if canImport(AppKit)
             let ns = NSColor(newValue)
             if let rgb = ns.usingColorSpace(.deviceRGB) {
-                red = rgb.redComponent
-                green = rgb.greenComponent
-                blue = rgb.blueComponent
+                red = Double(rgb.redComponent)
+                green = Double(rgb.greenComponent)
+                blue = Double(rgb.blueComponent)
             }
             #endif
         }
@@ -395,9 +395,9 @@ final class DeviceStore: ObservableObject {
             lightMode: lightMode.rawValue,
             lightBrightness: lightBrightness,
             lightSpeed: lightSpeed,
-            lightRed: rgb?.redComponent ?? 1,
-            lightGreen: rgb?.greenComponent ?? 0,
-            lightBlue: rgb?.blueComponent ?? 0,
+            lightRed: Double(rgb?.redComponent ?? 1),
+            lightGreen: Double(rgb?.greenComponent ?? 0),
+            lightBlue: Double(rgb?.blueComponent ?? 0),
             sleepMinutes: sleepMinutes,
             moveWake: moveWake,
             lodMM: lodMM,
