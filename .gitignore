@@ -26,6 +26,7 @@ Thumbs.db
 *.xcuserstate
 xcuserdata/
 DerivedData/
+macos/build/
 *.swp
 
 # Local logs / temp
