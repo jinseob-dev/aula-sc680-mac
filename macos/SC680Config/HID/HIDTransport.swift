@@ -113,6 +113,10 @@ final class HIDTransport {
                 // Probe Output 0x04 / 64 — required for 8K DPI writes.
                 if match == SC680DeviceIDs.dongle8K {
                     if probeOutput8K(candidate) {
+                        if let (extra, _, _) = fallback {
+                            IOHIDDeviceClose(extra, IOOptionBits(kIOHIDOptionsTypeNone))
+                            fallback = nil
+                        }
                         return finishOpen(mgr: mgr, candidate: candidate, match: match, page: page, mode: .output8K)
                     }
                     // Keep first openable interface as fallback; try other collections.
