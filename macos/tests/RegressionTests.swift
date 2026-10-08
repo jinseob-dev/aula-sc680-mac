@@ -1,4 +1,5 @@
 import Foundation
+import IOKit
 
 final class MockSession: DeviceSession {
     var onDeviceRemoved: (() -> Void)?
@@ -45,6 +46,33 @@ struct RegressionTests {
         @MainActor func makeStore(_ session: MockSession) -> DeviceStore {
             DeviceStore(session: session, storageDirectory: root.appendingPathComponent(UUID().uuidString))
         }
+
+        // Compound HID receivers need not have a vendor PrimaryUsagePage.
+        let compound = HIDInterfaceInfo(primaryUsagePage: 1, usagePages: [1, 0xFF00],
+            outputReportIDs: [4], featureReportIDs: [0x80], maxOutputSize: 64, maxFeatureSize: 8)
+        try check(compound.isConfigurationInterface && compound.supports8KOutput && compound.supportsFeatureUnlock,
+                  "Find configuration reports in a generic-desktop primary interface")
+        let reportsOnly = HIDInterfaceInfo(primaryUsagePage: 1, usagePages: [1],
+            outputReportIDs: [4], featureReportIDs: [], maxOutputSize: 64, maxFeatureSize: 0)
+        try check(reportsOnly.supports8KOutput, "Known receiver report capabilities are sufficient")
+        let mouse = HIDInterfaceInfo(primaryUsagePage: 1, usagePages: [1],
+            outputReportIDs: [], featureReportIDs: [], maxOutputSize: 0, maxFeatureSize: 0)
+        try check(!mouse.isConfigurationInterface, "Do not use a plain mouse input collection for configuration")
+        let shortReport = HIDInterfaceInfo(primaryUsagePage: 0xFF00, usagePages: [0xFF00],
+            outputReportIDs: [4], featureReportIDs: [], maxOutputSize: 20, maxFeatureSize: 0)
+        try check(!shortReport.supports8KOutput, "Do not send 64-byte reports to a short output interface")
+        let featureOnly = HIDInterfaceInfo(primaryUsagePage: 1, usagePages: [],
+            outputReportIDs: [], featureReportIDs: [0x80], maxOutputSize: 0, maxFeatureSize: 8)
+        try check(featureOnly.isConfigurationInterface && featureOnly.supportsFeatureUnlock,
+                  "Keep a separate Feature unlock interface")
+        let noReports = HIDTransport.discoveryFailure(openErrors: [], observations: ["primary=0x1; sharedOpen=0x00000000"]).localizedDescription
+        try check(noReports.contains("no supported configuration reports") && !noReports.contains("0xE00002BC"),
+                  "Never invent an open-blocked error when interfaces opened successfully")
+        let denied = HIDTransport.discoveryFailure(openErrors: [kIOReturnNotPermitted], observations: [])
+        if case .permissionDenied = denied {} else { throw TestError.failed("Classify actual permission denial") }
+        try check(denied.localizedDescription.contains("Input Monitoring"), "Give permission-specific recovery guidance")
+        let exclusive = HIDTransport.discoveryFailure(openErrors: [kIOReturnExclusiveAccess], observations: []).localizedDescription
+        try check(exclusive.contains("exclusive use") && exclusive.contains("0xE00002C5"), "Preserve actual exclusive-access error")
 
         // Captured Windows DPI packet is the independent framing/checksum reference.
         let fixture = try String(contentsOfFile: "docs/fixtures/dpi_write_64.hex", encoding: .utf8)

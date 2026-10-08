@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @EnvironmentObject private var store: DeviceStore
@@ -26,6 +27,14 @@ struct ContentView: View {
                     Button("Rescan") { Task { await store.refreshConnection() } }
                         .disabled(store.isBusy)
                         .buttonStyle(.borderedProminent)
+                    Button("Copy Connection Details") {
+                        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+                        let details = "SC680Config \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\nStatus: \(store.statusText)\n\(store.connectionDetails)"
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(details, forType: .string)
+                    }
+                    .disabled(store.isBusy)
+                    .font(.caption)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
