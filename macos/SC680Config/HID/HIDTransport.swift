@@ -7,6 +7,7 @@ struct HIDConnectionInfo {
     let transportMode: TransportMode
     let hasFeaturePath: Bool
     let hasOutputPath: Bool
+    var diagnostics: String = ""
 }
 
 protocol DeviceSession: AnyObject {
@@ -50,14 +51,17 @@ final class HIDClient: DeviceSession {
                     try transport.openFirstMatching()
                     opened = true
                     break
-                } catch { lastError = error }
+                } catch {
+                    if case HIDTransportError.permissionDenied = error { throw error }
+                    lastError = error
+                }
             }
             if !opened { throw lastError }
         }
         guard let identity = transport.identity else { throw HIDTransportError.deviceNotFound }
         return HIDConnectionInfo(identity: identity, productName: transport.productName,
                                  transportMode: transport.transportMode,
-                                 hasFeaturePath: transport.hasFeaturePath, hasOutputPath: transport.hasOutputPath)
+                                 hasFeaturePath: transport.hasFeaturePath, hasOutputPath: transport.hasOutputPath, diagnostics: transport.connectionDiagnostics)
     }
 
     func open(forceReopen: Bool) async throws -> HIDConnectionInfo {
@@ -114,12 +118,15 @@ final class HIDClient: DeviceSession {
 enum HIDTransportError: Error, LocalizedError {
     case deviceNotFound
     case openFailed(String)
+    case permissionDenied(String)
     case reportFailed(String)
 
     var errorDescription: String? {
         switch self {
         case .deviceNotFound:
             return "SC680 receiver not found (plug 2.4G dongle, not Bluetooth)"
+        case .permissionDenied(let detail):
+            return "macOS denied HID access. Enable SC680Config in System Settings → Privacy & Security → Input Monitoring, quit and reopen the app, then Rescan. \(detail)"
         case .openFailed(let detail):
             return "Failed to open HID device — \(detail)"
         case .reportFailed(let s):
@@ -154,6 +161,7 @@ final class HIDTransport {
     private(set) var usagePage: Int = 0
     private(set) var hasFeaturePath: Bool = false
     private(set) var hasOutputPath: Bool = false
+    private(set) var connectionDiagnostics: String = ""
 
     /// Called on callbackQueue when one of the selected interfaces is removed.
     var onDeviceRemoved: (() -> Void)?
@@ -187,17 +195,16 @@ final class HIDTransport {
     @discardableResult
     func openFirstMatching() throws -> USBIdentity {
         close()
-
+        connectionDiagnostics = ""
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         IOHIDManagerSetDeviceMatchingMultiple(mgr, matchingDictionaries() as CFArray)
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-
         let openKr = IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
         guard openKr == kIOReturnSuccess else {
             IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-            throw HIDTransportError.openFailed(String(format: "IOHIDManagerOpen 0x%08X (USB permission or restart Mac)", openKr))
+            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
+            throw Self.discoveryFailure(openErrors: [openKr], observations: ["IOHIDManagerOpen"])
         }
-
         guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
@@ -205,151 +212,116 @@ final class HIDTransport {
         }
 
         let ranked = set.sorted { score($0) > score($1) }
-        var lastOpenError: kern_return_t = kIOReturnError
-        var sawKnownVIDPID = false
-        var openedOutput: (IOHIDDevice, USBIdentity, Int)?
-        var openedFeature: (IOHIDDevice, USBIdentity, Int)?
-        var extrasToClose: [IOHIDDevice] = []
+        var openedOutput: (IOHIDDevice, USBIdentity, HIDInterfaceInfo)?
+        var openedFeature: (IOHIDDevice, USBIdentity, HIDInterfaceInfo)?
+        var observations = [String]()
+        var openErrors = [kern_return_t]()
+        var sawKnownReceiver = false
 
         for candidate in ranked {
             let vid = intProperty(candidate, kIOHIDVendorIDKey)
             let pid = intProperty(candidate, kIOHIDProductIDKey)
-            guard let match = SC680DeviceIDs.known.first(where: { $0.vendorID == vid && $0.productID == pid }) else {
-                continue
-            }
-            sawKnownVIDPID = true
-            let page = intProperty(candidate, kIOHIDPrimaryUsagePageKey)
-            guard (page & 0xFF00) == 0xFF00 else { continue }
-            // Never pair the Output collection of one receiver with another receiver's Feature collection.
+            guard let match = SC680DeviceIDs.known.first(where: { $0.vendorID == vid && $0.productID == pid }) else { continue }
+            sawKnownReceiver = true
             if let selected = openedOutput ?? openedFeature {
                 guard match == selected.1,
                       intProperty(candidate, kIOHIDLocationIDKey) == intProperty(selected.0, kIOHIDLocationIDKey) else { continue }
             }
 
+            // A compound mouse interface can have PrimaryUsagePage=0x01 while also
+            // exposing Output 0x04 and Feature 0x80. Try shared open before filtering.
             let shared = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeNone))
-            var opened = shared == kIOReturnSuccess
-            if !opened {
-                lastOpenError = shared
-                let seized = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
-                opened = seized == kIOReturnSuccess
-                if !opened {
-                    lastOpenError = seized
-                    continue
+            let info = interfaceInfo(candidate)
+            observations.append("\(match.label) \(info.summary); sharedOpen=\(String(format: "0x%08X", shared))")
+            guard shared == kIOReturnSuccess else {
+                openErrors.append(shared)
+                continue
+            }
+            guard info.isConfigurationInterface else {
+                IOHIDDeviceClose(candidate, IOOptionBits(kIOHIDOptionsTypeNone))
+                continue
+            }
+
+            var kept = false
+            if info.supports8KOutput, openedOutput == nil {
+                openedOutput = (candidate, match, info)
+                kept = true
+            }
+            if info.supportsFeatureConfiguration,
+               openedFeature == nil || (info.supportsFeatureUnlock && openedFeature?.2.supportsFeatureUnlock == false) {
+                if let previous = openedFeature, previous.0 !== openedOutput?.0 {
+                    IOHIDDeviceClose(previous.0, IOOptionBits(kIOHIDOptionsTypeNone))
                 }
+                openedFeature = (candidate, match, info)
+                kept = true
             }
-
-            let canOut = probeOutput8K(candidate)
-            let canFeat = probeFeatureUnlock(candidate)
-
-            if canOut, openedOutput == nil {
-                openedOutput = (candidate, match, page)
-            } else if canFeat, openedFeature == nil {
-                openedFeature = (candidate, match, page)
-            } else if openedOutput == nil && openedFeature == nil {
-                // Keep something openable even if probes are inconclusive.
-                openedOutput = (candidate, match, page)
-            } else {
-                extrasToClose.append(candidate)
-            }
-
-            if openedOutput != nil, openedFeature != nil { break }
-            // Same interface may support both.
-            if canOut && canFeat {
-                openedFeature = openedOutput
-                break
-            }
+            if !kept { IOHIDDeviceClose(candidate, IOOptionBits(kIOHIDOptionsTypeNone)) }
+            if openedOutput != nil && openedFeature?.2.supportsFeatureUnlock == true { break }
         }
 
-        for extra in extrasToClose {
-            IOHIDDeviceClose(extra, IOOptionBits(kIOHIDOptionsTypeNone))
-        }
-
-        guard let out = openedOutput ?? openedFeature else {
+        connectionDiagnostics = observations.joined(separator: "\n")
+        guard let selected = openedOutput ?? openedFeature else {
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
-            if sawKnownVIDPID {
-                throw HIDTransportError.openFailed(
-                    String(
-                        format: "dongle seen but open blocked (0x%08X). Quit other mouse apps, unplug/replug dongle, then Rescan",
-                        lastOpenError
-                    )
-                )
-            }
-            throw HIDTransportError.deviceNotFound
+            if !sawKnownReceiver { throw HIDTransportError.deviceNotFound }
+            throw Self.discoveryFailure(openErrors: openErrors, observations: observations)
         }
-
         manager = mgr
-        outputDevice = out.0
-        featureDevice = openedFeature?.0 ?? out.0
-        identity = out.1
-        usagePage = out.2
-        productName = stringProperty(out.0, kIOHIDProductKey) ?? out.1.label
-        hasOutputPath = openedOutput != nil && probeOutput8K(out.0)
-        hasFeaturePath = featureDevice != nil && probeFeatureUnlock(featureDevice!)
-        if hasOutputPath && hasFeaturePath {
-            transportMode = .dual8K
-        } else if hasOutputPath || out.1 == SC680DeviceIDs.dongle8K {
-            transportMode = .output8K
-        } else {
-            transportMode = .feature
-        }
+        outputDevice = openedOutput?.0
+        featureDevice = openedFeature?.0
+        identity = selected.1
+        usagePage = selected.2.primaryUsagePage
+        productName = stringProperty(selected.0, kIOHIDProductKey) ?? selected.1.label
+        hasOutputPath = openedOutput != nil
+        hasFeaturePath = openedFeature?.2.supportsFeatureUnlock == true
+        transportMode = hasOutputPath ? (hasFeaturePath ? .dual8K : .output8K) : .feature
 
         IOHIDManagerRegisterDeviceRemovalCallback(mgr, { context, _, _, removedDevice in
             guard let context else { return }
             let transport = Unmanaged<HIDTransport>.fromOpaque(context).takeUnretainedValue()
-            transport.callbackQueue.async {
-                transport.handleRemoval(removedDevice)
-            }
+            transport.callbackQueue.async { transport.handleRemoval(removedDevice) }
         }, Unmanaged.passUnretained(self).toOpaque())
-
-        return out.1
+        return selected.1
     }
 
-    private func probeOutput8K(_ candidate: IOHIDDevice) -> Bool {
-        var probe = [UInt8](repeating: 0, count: BekenCodec.outputLength8K)
-        probe[0] = BekenCodec.outputReportID8K
-        let kr = probe.withUnsafeMutableBufferPointer { buf in
-            IOHIDDeviceSetReport(
-                candidate,
-                kIOHIDReportTypeOutput,
-                CFIndex(BekenCodec.outputReportID8K),
-                buf.baseAddress!,
-                buf.count
-            )
+    static func discoveryFailure(openErrors: [kern_return_t], observations: [String]) -> HIDTransportError {
+        let details = observations.joined(separator: "\n")
+        if let denied = openErrors.first(where: { $0 == kIOReturnNotPermitted || $0 == kIOReturnNotPrivileged }) {
+            return .permissionDenied(String(format: "0x%08X", denied) + "\n" + details)
         }
-        return kr == kIOReturnSuccess
+        if let busy = openErrors.first(where: { $0 == kIOReturnExclusiveAccess }) {
+            return .openFailed("Receiver is in exclusive use (\(String(format: "0x%08X", busy))). Quit other mouse configuration apps, then Rescan.\n\(details)")
+        }
+        if let error = openErrors.last {
+            return .openFailed("Receiver detected; shared open failed (\(String(format: "0x%08X", error))).\n\(details)")
+        }
+        return .openFailed("Receiver detected and opened, but no supported configuration reports were found. Copy Connection Details for diagnosis.\n\(details)")
     }
 
-    private func probeFeatureUnlock(_ candidate: IOHIDDevice) -> Bool {
-        // Probe with GetFeature on unlock report id — cheaper than writing unlock.
-        var buffer = [UInt8](repeating: 0, count: 7)
-        buffer[0] = BekenCodec.unlockReportID
-        var len = buffer.count
-        let kr = buffer.withUnsafeMutableBufferPointer { buf in
-            IOHIDDeviceGetReport(
-                candidate,
-                kIOHIDReportTypeFeature,
-                CFIndex(BekenCodec.unlockReportID),
-                buf.baseAddress!,
-                &len
-            )
+    private func interfaceInfo(_ device: IOHIDDevice) -> HIDInterfaceInfo {
+        var pages = Set<Int>()
+        if let pairs = IOHIDDeviceGetProperty(device, kIOHIDDeviceUsagePairsKey as CFString) as? [[String: Any]] {
+            for pair in pairs {
+                if let page = pair[kIOHIDDeviceUsagePageKey] as? NSNumber { pages.insert(page.intValue) }
+            }
         }
-        if kr == kIOReturnSuccess { return true }
-        // Some firmwares reject get but accept set — try a no-op-sized set of zeros is unsafe.
-        // Accept Feature DPI get as evidence of a Feature collection.
-        buffer = [UInt8](repeating: 0, count: 52)
-        buffer[0] = BekenCodec.dpiReportID
-        len = buffer.count
-        let kr2 = buffer.withUnsafeMutableBufferPointer { buf in
-            IOHIDDeviceGetReport(
-                candidate,
-                kIOHIDReportTypeFeature,
-                CFIndex(BekenCodec.dpiReportID),
-                buf.baseAddress!,
-                &len
-            )
+        var outputIDs = Set<Int>()
+        var featureIDs = Set<Int>()
+        if let elements = IOHIDDeviceCopyMatchingElements(device, nil, IOOptionBits(kIOHIDOptionsTypeNone)) as? [IOHIDElement] {
+            for element in elements {
+                pages.insert(Int(IOHIDElementGetUsagePage(element)))
+                let reportID = Int(IOHIDElementGetReportID(element))
+                switch IOHIDElementGetType(element) {
+                case kIOHIDElementTypeOutput: outputIDs.insert(reportID)
+                case kIOHIDElementTypeFeature: featureIDs.insert(reportID)
+                default: break
+                }
+            }
         }
-        return kr2 == kIOReturnSuccess
+        return HIDInterfaceInfo(primaryUsagePage: intProperty(device, kIOHIDPrimaryUsagePageKey),
+            usagePages: pages, outputReportIDs: outputIDs, featureReportIDs: featureIDs,
+            maxOutputSize: intProperty(device, kIOHIDMaxOutputReportSizeKey),
+            maxFeatureSize: intProperty(device, kIOHIDMaxFeatureReportSizeKey))
     }
 
     private func matchingDictionaries() -> [[String: Any]] {
@@ -534,10 +506,13 @@ final class HIDTransport {
     private func score(_ device: IOHIDDevice) -> Int {
         let vid = intProperty(device, kIOHIDVendorIDKey)
         let pid = intProperty(device, kIOHIDProductIDKey)
-        let page = intProperty(device, kIOHIDPrimaryUsagePageKey)
+        let info = interfaceInfo(device)
+        let page = info.primaryUsagePage
         var s = 0
         if vid == SC680DeviceIDs.dongle8K.vendorID && pid == SC680DeviceIDs.dongle8K.productID { s += 100 }
         if vid == SC680DeviceIDs.dongleStandard.vendorID && pid == SC680DeviceIDs.dongleStandard.productID { s += 50 }
+        if info.supports8KOutput { s += 40 }
+        if info.supportsFeatureUnlock { s += 30 }
         if page == Int(SC680DeviceIDs.usagePageVendorFF00) { s += 20 }
         if page == Int(SC680DeviceIDs.usagePageVendorFF04) { s += 15 }
         if page == Int(SC680DeviceIDs.usagePageVendorFF02) { s += 10 }

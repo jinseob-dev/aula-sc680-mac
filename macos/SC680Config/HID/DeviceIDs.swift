@@ -25,3 +25,36 @@ struct USBIdentity: Hashable, Sendable {
         String(format: "%04X:%04X", vendorID, productID)
     }
 }
+
+/// A receiver may expose mouse and configuration collections on the same HID interface.
+/// PrimaryUsagePage alone does not describe all of its report capabilities.
+struct HIDInterfaceInfo {
+    let primaryUsagePage: Int
+    let usagePages: Set<Int>
+    let outputReportIDs: Set<Int>
+    let featureReportIDs: Set<Int>
+    let maxOutputSize: Int
+    let maxFeatureSize: Int
+
+    var hasVendorCollection: Bool {
+        usagePages.union([primaryUsagePage]).contains { ($0 & 0xFF00) == 0xFF00 }
+    }
+    var supports8KOutput: Bool {
+        outputReportIDs.contains(0x04) && (maxOutputSize <= 0 || maxOutputSize >= 63)
+    }
+    var supportsFeatureUnlock: Bool { featureReportIDs.contains(0x80) }
+    var supportsFeatureConfiguration: Bool {
+        !featureReportIDs.isDisjoint(with: [0x04, 0x05, 0x06, 0x08, 0x80])
+    }
+    var isConfigurationInterface: Bool {
+        supports8KOutput || supportsFeatureConfiguration
+    }
+
+    var summary: String {
+        func hexList(_ values: Set<Int>) -> String {
+            values.sorted().map { String(format: "0x%X", $0) }.joined(separator: ",")
+        }
+        return "primary=\(String(format: "0x%X", primaryUsagePage)), usages=[\(hexList(usagePages))], " +
+            "Output=[\(hexList(outputReportIDs))]/\(maxOutputSize), Feature=[\(hexList(featureReportIDs))]/\(maxFeatureSize)"
+    }
+}

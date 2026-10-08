@@ -171,6 +171,7 @@ final class DeviceStore: ObservableObject {
     @Published var isCharging: Bool = false
     @Published var statusText: String = "Connect the SC680 via 2.4G dongle or USB-C."
     @Published var lastTransport: String = ""
+    @Published private(set) var connectionDetails: String = "No scan performed."
 
     @Published var profileDocs: [MouseProfile] = []
     @Published var activeProfileIndex: Int = 0
@@ -228,6 +229,7 @@ final class DeviceStore: ObservableObject {
         isBusy = true
         defer { isBusy = false }
         statusText = "Connecting…"
+        connectionDetails = ""
         do {
             let info = try await session.open(forceReopen: true)
             updateConnection(info)
@@ -240,6 +242,7 @@ final class DeviceStore: ObservableObject {
         connection = info.identity == SC680DeviceIDs.dongle8K ? .wireless8K : .wireless
         productName = info.productName
         lastTransport = info.transportMode.rawValue
+        connectionDetails = "Receiver: \(info.identity.label), transport: \(info.transportMode.rawValue)\n" + info.diagnostics
     }
 
     private func markDisconnected(reason: String) {
@@ -248,7 +251,8 @@ final class DeviceStore: ObservableObject {
         batteryPercent = nil
         lastTransport = ""
         rawButtons = nil
-        statusText = reason
+        connectionDetails = reason + "\n" + connectionDetails
+        statusText = reason.components(separatedBy: "\n").first ?? reason
     }
 
     func syncFromDevice() async {
