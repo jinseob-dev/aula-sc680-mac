@@ -89,7 +89,7 @@ struct RegressionTests {
         try check(inbox.response(reportID: 4, receivedAfter: 101, timeout: 0) == nil,
                   "Never use a pre-write response to verify a new configuration")
         let interruptRate = BekenCodec.encodeRate(hz: 500)
-        inbox.record(reportID: 4, data: Data(BekenCodec.wrapFor8KOutput(interruptRate).dropFirst()), receivedAt: 200)
+        inbox.record(reportID: 4, data: interruptRate, receivedAt: 200)
         try check(BekenCodec.decodeRate(inbox.response(reportID: 6, receivedAfter: 199, timeout: 0)!) == 500,
                   "Handle callback payloads where IOKit supplies report ID separately")
         inbox.record(reportID: 1, data: Data([1, 0, 0, 0, 0, 0, 50]), receivedAt: 201)
@@ -108,17 +108,50 @@ struct RegressionTests {
         let decoded = BekenCodec.decodeDPI(captured)!
         try check(decoded.slots.prefix(5) == [400, 800, 1600, 3200, 6400], "Captured DPI values")
         try check(decoded.activeIndex == 1 && decoded.enabledMask == 0x1F, "Captured DPI stage/mask")
-        let encoded = BekenCodec.encodeDPIOutput64(slots: [400, 800, 1600, 3200, 6400], activeIndex: 1,
+        let encoded = BekenCodec.encodeDPI(slots: [400, 800, 1600, 3200, 6400], activeIndex: 1,
             colors: [(255,0,0), (0,255,0), (0,0,255), (255,0,255), (0,255,255)], enabledMask: 0x1F)
-        try check(encoded == captured, "DPI encoder must match the captured packet exactly")
+        try check(encoded == Data(captured.prefix(52)), "Generic DPI encoder matches the historical API probe")
         var corrupt = captured; corrupt[50] ^= 1
         try check(BekenCodec.decodeDPI(corrupt) == nil, "Reject bad DPI checksum")
         try check(BekenCodec.response(from: captured, reportID: 0x06) == nil, "Do not decode DPI as polling")
         let rate = BekenCodec.encodeRate(hz: 500)
-        try check(BekenCodec.decodeRate(BekenCodec.response(from: BekenCodec.wrapFor8KOutput(rate), reportID: 0x06)!) == 500,
+        try check(BekenCodec.decodeRate(BekenCodec.response(from: Data([4]) + rate, reportID: 0x06)!) == 500,
                   "Unwrap the requested polling response")
         try check(BekenCodec.response(from: Data([0x04] + [UInt8](repeating: 0, count: 63)), reportID: 0x04) == nil,
                   "Reject empty input report")
+        // Independent OEM-derived vectors; these are not device read responses.
+        let oemFixture = try String(contentsOfFile: "docs/fixtures/oem_8k_dpi_output.hex", encoding: .utf8)
+        let oemHex = oemFixture.split(separator: "\n").filter { !$0.hasPrefix("#") }.joined(separator: " ")
+        let expectedOEM = Data(oemHex.split(whereSeparator: { $0.isWhitespace }).map { UInt8($0, radix: 16)! })
+        let oemOutput = try BekenCodec.encode8KConfiguration(encoded)
+        try check(oemOutput == expectedOEM, "Match the OEM length, payload, indication and both checksums")
+        try check(BekenCodec.is8KOutputEnvelope(oemOutput), "Validate output envelope")
+        var corruptOEM = oemOutput; corruptOEM[60] ^= 1
+        try check(!BekenCodec.is8KOutputEnvelope(corruptOEM), "Reject corrupted outer checksum")
+        try check(!BekenCodec.is8KOutputEnvelope(captured), "The old raw DPI API probe is not an OEM envelope")
+        for (hz, code) in [(125, UInt8(0x20)), (250, 0x10), (500, 0x08),
+                           (1000, 0x04), (2000, 0x02), (4000, 0x01), (8000, 0x40)] {
+            let output = try BekenCodec.encode8KConfiguration(BekenCodec.encodeRate(hz: hz))
+            try check(output[1] == 14 && output[6] == code && output[7] == ~code,
+                      "OEM polling code for \(hz) Hz")
+        }
+        let fullButtons = try BekenCodec.encode8KConfiguration(BekenCodec.encodeButtons([2, 3, 4]))
+        try check(fullButtons.count == 64 && fullButtons[1] == 64 && BekenCodec.is8KOutputEnvelope(fullButtons),
+                  "59-byte buttons fit exactly without truncating their checksum")
+        for unsupported in [Data(repeating: 0, count: 60), Data(), BekenCodec.unlockPackets()[0],
+                            BekenCodec.encodeApplyCommit(), BekenCodec.encodeParams(debounceMs: 8, angleSnap: false, ripple: false)] {
+            var rejected = false
+            do { _ = try BekenCodec.encode8KConfiguration(unsupported) } catch { rejected = true }
+            try check(rejected, "Reject unconfirmed commands before transport")
+        }
+        var oversizedRejected = false
+        do { _ = try BekenCodec.wrapFor8KOutput(Data(repeating: 1, count: 60)) } catch { oversizedRejected = true }
+        try check(oversizedRejected, "Never silently truncate an oversized command")
+        inbox.record(reportID: 3, data: Data([3, 0x10, 0x10, 2, 0]), receivedAt: 400)
+        try check(inbox.summary.contains("OEM Input 0x03: 1 events"), "Observe OEM telemetry reports")
+        try check(inbox.response(reportID: 4, receivedAfter: 399, timeout: 0) == nil,
+                  "Telemetry is not a complete DPI configuration or readback")
+
         let minimum = BekenCodec.encodeDPI(slots: [50], activeIndex: 0, colors: [], enabledMask: 1)
         try check(BekenCodec.decodeDPI(minimum)?.slots[0] == 50, "50 DPI must survive readback")
         let actions: [ButtonAction] = [.leftClick, .rightClick, .middleClick, .forward, .backward,
@@ -153,7 +186,8 @@ struct RegressionTests {
         await store.applyOnly(.dpi)
         let writtenDPI = session.writes.first { $0[0] == 4 && $0[1] == 0x38 }!
         try check(writtenDPI[5] == 0x1F && writtenDPI[29] == 255, "Preserve DPI mask and color on Apply")
-        try check(store.statusText.hasPrefix("Applied and verified"), "Only matching readback may report verified")
+        try check(store.statusText.contains("Persistence after power-cycle is unverified"), "Readback must not imply confirmed persistence")
+        try check(!session.writes.contains { $0.first == 0x0C }, "Do not send the guessed 8K commit")
         store.buttons[2].action = .doubleClick
         await store.applyOnly(.buttons)
         let writtenButtons = session.writes.last { $0[0] == 8 }!

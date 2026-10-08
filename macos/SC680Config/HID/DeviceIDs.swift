@@ -69,11 +69,19 @@ final class HIDResponseInbox {
     private var frames: [(time: TimeInterval, data: Data)] = []
     private var receivedCount = 0
     private var lastPreview = "none"
+    private var telemetryCount = 0
+    private var telemetryPreview = "none"
 
     func record(reportID: Int, data: Data, receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
-        guard reportID == Int(BekenCodec.outputReportID8K), !data.isEmpty, data.count <= 64 else { return }
+        guard [3, Int(BekenCodec.outputReportID8K)].contains(reportID), !data.isEmpty, data.count <= 64 else { return }
         condition.lock()
         defer { condition.unlock() }
+        if reportID == 3 {
+            // OEM monitor consumes this short event report, not a settings dump.
+            telemetryCount += 1
+            telemetryPreview = data.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " ")
+            return
+        }
         receivedCount += 1
         lastPreview = data.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " ")
         frames.append((receivedAt, data))
@@ -101,6 +109,6 @@ final class HIDResponseInbox {
     var summary: String {
         condition.lock()
         defer { condition.unlock() }
-        return "Interrupt Input 0x04: \(receivedCount) reports; last prefix: \(lastPreview)"
+        return "Interrupt Input 0x04: \(receivedCount) reports; last prefix: \(lastPreview)\nOEM Input 0x03: \(telemetryCount) events; last prefix: \(telemetryPreview)"
     }
 }

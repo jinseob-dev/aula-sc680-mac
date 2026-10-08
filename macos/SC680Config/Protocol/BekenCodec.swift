@@ -31,14 +31,14 @@ enum BekenCodec {
         ]
     }
 
-    /// Windows WriteUSB path: 52-byte DPI struct padded to 64, report id 0x04.
+    /// OEM 8K configuration envelope, sized for the macOS HID descriptor.
     static func encodeDPIOutput64(
         slots: [Int],
         activeIndex: Int,
         colors: [(UInt8, UInt8, UInt8)],
         enabledMask: UInt8 = 0xFF
-    ) -> Data {
-        wrapFor8KOutput(encodeDPI(slots: slots, activeIndex: activeIndex, colors: colors, enabledMask: enabledMask))
+    ) throws -> Data {
+        try encode8KConfiguration(encodeDPI(slots: slots, activeIndex: activeIndex, colors: colors, enabledMask: enabledMask))
     }
 
     /// Commit/apply poke used by OEM after config writes (report 0x0C, or wrapped on 8K).
@@ -305,20 +305,62 @@ enum BekenCodec {
 
     // MARK: - 8K output wrapping
 
-    /// Pack a Beken feature-style packet for the 8K dongle Output report path.
-    static func wrapFor8KOutput(_ packet: Data) -> Data {
-        var out = [UInt8](repeating: 0, count: outputLength8K)
-        if packet.first == outputReportID8K {
-            // DPI (and any packet already using report id 0x04)
-            let n = min(packet.count, outputLength8K)
-            for i in 0..<n { out[i] = packet[i] }
-        } else {
-            // HID output report id must be 0x04; embed full Beken packet after it.
-            out[0] = outputReportID8K
-            let n = min(packet.count, outputLength8K - 1)
-            for i in 0..<n { out[1 + i] = packet[i] }
+    /// Mouse.exe VA 0x4150BB: [04, inner length + 5, 00, inner, sum16 BE].
+    /// Windows passes a 65-byte API buffer; this receiver's macOS descriptor
+    /// permits 64 bytes including the report ID. No command bytes are truncated.
+    static func wrapFor8KOutput(_ packet: Data) throws -> Data {
+        guard !packet.isEmpty, packet.count <= outputLength8K - 5 else {
+            throw HIDTransportError.reportFailed("8K packet does not fit the receiver output report")
         }
+        var out = [UInt8](repeating: 0, count: outputLength8K)
+        out[0] = outputReportID8K
+        out[1] = UInt8(packet.count + 5)
+        for (i, value) in packet.enumerated() { out[3 + i] = value }
+        let sum = out.prefix(packet.count + 3).reduce(UInt16(0)) { $0 &+ UInt16($1) }
+        out[packet.count + 3] = UInt8(sum >> 8)
+        out[packet.count + 4] = UInt8(sum & 0xFF)
         return Data(out)
+    }
+
+    /// Translate the existing generic Beken model into the uploaded SC680 OEM
+    /// program's wire format. Unconfirmed commands are rejected before USB I/O.
+    static func encode8KConfiguration(_ packet: Data) throws -> Data {
+        var inner = [UInt8](packet)
+        switch packet.first {
+        case dpiReportID:
+            guard packet.count == 52, decodeDPI(packet) != nil else {
+                throw HIDTransportError.reportFailed("unconfirmed 8K light/DPI command")
+            }
+            // Mouse.exe 0x415DD7 sets indication=1; 0x415E6E sends 0x38 bytes.
+            inner[49] = 1
+            let sum = inner[3...49].reduce(UInt16(0)) { $0 &+ UInt16($1) }
+            inner[50] = UInt8(sum >> 8); inner[51] = UInt8(sum & 0xFF)
+            inner += [0, 0, 0, 0]
+        case rateReportID:
+            guard packet.count == 9, let hz = decodeRate(packet) else {
+                throw HIDTransportError.reportFailed("invalid polling command")
+            }
+            // OEM 0x4159D5..0x415A3B and telemetry handler 0x413AB0.
+            let codes: [Int: UInt8] = [125: 0x20, 250: 0x10, 500: 0x08,
+                1000: 0x04, 2000: 0x02, 4000: 0x01, 8000: 0x40]
+            guard let code = codes[hz] else { throw HIDTransportError.reportFailed("unsupported polling rate") }
+            inner[3] = code; inner[4] = ~code
+        case buttonReportID:
+            guard decodeButtons(packet) != nil else { throw HIDTransportError.reportFailed("invalid button command") }
+            // OEM sends exactly 59 bytes; remaining generic bytes are padding.
+            inner = Array(packet.prefix(59))
+        default:
+            throw HIDTransportError.reportFailed("8K command not verified against the SC680 OEM program")
+        }
+        return try wrapFor8KOutput(Data(inner))
+    }
+
+    static func is8KOutputEnvelope(_ packet: Data) -> Bool {
+        guard packet.count == outputLength8K, packet[0] == outputReportID8K,
+              packet[2] == 0 else { return false }
+        let count = Int(packet[1])
+        guard (6...outputLength8K).contains(count) else { return false }
+        return checksum(packet, from: 0, through: count - 3, at: count - 2)
     }
 
     // MARK: - Helpers

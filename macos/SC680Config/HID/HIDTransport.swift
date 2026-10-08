@@ -80,10 +80,8 @@ final class HIDClient: DeviceSession {
             Thread.sleep(forTimeInterval: 0.2)
             return true
         }
-        for packet in BekenCodec.unlockPackets() {
-            try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
-            Thread.sleep(forTimeInterval: 0.08)
-        }
+        // The OEM 8K DLL's Open_FeatureDevice is a success-returning stub.
+        // No evidence supports sending Feature 0x80 as an Output command.
         return false
     }
 
@@ -202,7 +200,7 @@ final class HIDTransport {
         onMain {
             IOHIDDeviceRegisterInputReportCallback(outputDevice, inputBuffer, 64, { context, result, _, type, reportID, report, length in
                 guard let context, result == kIOReturnSuccess, type == kIOHIDReportTypeInput,
-                      reportID == 4, length > 0, length <= 64 else { return }
+                      (reportID == 3 || reportID == 4), length > 0, length <= 64 else { return }
                 let transport = Unmanaged<HIDTransport>.fromOpaque(context).takeUnretainedValue()
                 transport.responseInbox.record(reportID: Int(reportID), data: Data(bytes: report, count: length))
             }, Unmanaged.passUnretained(self).toOpaque())
@@ -456,7 +454,7 @@ final class HIDTransport {
                 return
             }
             do {
-                try send8KOutput(BekenCodec.wrapFor8KOutput(packet))
+                try send8KOutput(BekenCodec.encode8KConfiguration(packet))
                 return
             } catch {
                 if hasFeaturePath {
@@ -470,12 +468,15 @@ final class HIDTransport {
         do {
             try setFeatureReport(packet)
         } catch {
-            try send8KOutput(BekenCodec.wrapFor8KOutput(packet))
+            try send8KOutput(BekenCodec.encode8KConfiguration(packet))
         }
     }
 
     func send8KOutput(_ packet: Data) throws {
         guard let outputDevice else { throw HIDTransportError.openFailed("no Output path — tap Rescan") }
+        guard BekenCodec.is8KOutputEnvelope(packet) else {
+            throw HIDTransportError.reportFailed("refusing an unframed or oversized 8K output command")
+        }
         var bytes = [UInt8](repeating: 0, count: BekenCodec.outputLength8K)
         let n = min(packet.count, bytes.count)
         for i in 0..<n { bytes[i] = packet[i] }
