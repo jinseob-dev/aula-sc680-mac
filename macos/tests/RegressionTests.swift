@@ -183,6 +183,7 @@ struct RegressionTests {
                   "Show the real power event even when Feature battery read fails")
         try check(!telemetryStore.statusText.contains("Battery") && telemetryStore.statusText.contains("DPI"),
                   "Only battery is resolved; full settings remain unread")
+        telemetrySession.echoWrites = false
         await telemetryStore.applyAll()
         try check(telemetrySession.writes.map { $0[0] } == [4, 6],
                   "Apply All sends supported sections and preserves unread buttons")
