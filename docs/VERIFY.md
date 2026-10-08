@@ -54,3 +54,22 @@ If the mouse misbehaves after a bad write:
 1. Connect USB-C wired.
 2. Open Windows OEM app → Reset profile.
 3. Power-cycle mouse.
+
+## Automated regressions (macOS)
+
+Run `bash macos/scripts/run-regression-tests.sh` from the repository root. The
+`macOS checks` workflow runs the same tests and builds the app on pull requests.
+Mock tests verify app behavior; they do not establish firmware support.
+
+## Settings preservation and failure reporting
+
+- [ ] Set a custom Middle action and distinct Forward/Back actions; Apply, Rescan,
+      and verify the same assignments remain.
+- [ ] Disable DPI stages 6–8 and set distinctive stage colors; Rescan then Apply
+      must preserve both the disabled mask and colors.
+- [ ] Disconnect or prevent readback during Apply; status must remain unverified
+      or failed, never claim all settings were verified.
+- [ ] Change LOD, Sleep Timer, and Move Wake; UI must identify local storage only.
+- [ ] Apply during receiver reset; UI stays responsive and duplicate operations
+      are disabled.
+- [ ] Power-cycle the mouse after a verified write to check persistence separately.

@@ -82,15 +82,17 @@ enum BekenCodec {
         return Data(buf)
     }
 
-    static func decodeDPI(_ data: Data) -> (slots: [Int], activeIndex: Int)? {
-        guard data.count >= 52, data[0] == dpiReportID else { return nil }
+    static func decodeDPI(_ data: Data) -> (slots: [Int], activeIndex: Int, enabledMask: UInt8, colors: [(UInt8, UInt8, UInt8)])? {
+        guard data.count >= 52, data[0] == dpiReportID, data[1] == dpiCommand,
+              (1...8).contains(Int(data[24])), checksum(data, from: 3, through: 49, at: 50) else { return nil }
         var slots = [Int]()
+        var colors = [(UInt8, UInt8, UInt8)]()
         for i in 0..<8 {
             let dpi = bytesToDPI(data[8 + i], data[16 + i])
             slots.append(dpi)
+            colors.append((data[25 + i * 3], data[26 + i * 3], data[27 + i * 3]))
         }
-        let active = max(0, Int(data[24]) - 1)
-        return (slots, active)
+        return (slots, Int(data[24]) - 1, data[5], colors)
     }
 
     // MARK: - Rate
@@ -106,7 +108,8 @@ enum BekenCodec {
     }
 
     static func decodeRate(_ data: Data) -> Int? {
-        guard data.count >= 4, data[0] == rateReportID else { return nil }
+        guard data.count >= 5, data[0] == rateReportID, data[1] == rateCommand,
+              data[4] == ~data[3] else { return nil }
         return hz(for: data[3])
     }
 
@@ -123,7 +126,7 @@ enum BekenCodec {
         }
     }
 
-    static func hz(for interval: UInt8) -> Int {
+    static func hz(for interval: UInt8) -> Int? {
         switch interval {
         case 0x10: return 8000
         case 0x20: return 4000
@@ -132,7 +135,7 @@ enum BekenCodec {
         case 0x02: return 500
         case 0x04: return 250
         case 0x08: return 125
-        default: return 1000
+        default: return nil
         }
     }
 
@@ -161,19 +164,30 @@ enum BekenCodec {
         return Data(buf)
     }
 
-    static func decodeParams(_ data: Data) -> (debounceMs: Int, angleSnap: Bool, ripple: Bool)? {
-        guard data.count >= 13, data[0] == paramReportID else { return nil }
-        return (Int(data[5]) * 2, (data[10] & 0x02) != 0, (data[10] & 0x04) != 0)
+    static func decodeParams(_ data: Data) -> (debounceMs: Int, angleSnap: Bool, ripple: Bool, motionSync: Bool)? {
+        guard data.count >= 13, data[0] == paramReportID, data[1] == paramCommand,
+              data[12] == data[4] &+ data[5] &+ data[10] else { return nil }
+        return (Int(data[5]) * 2, (data[10] & 0x02) != 0, (data[10] & 0x04) != 0, (data[10] & 0x08) != 0)
     }
 
     // MARK: - Buttons
 
-    static func encodeButtons(_ actions: [UInt8], profile: UInt8 = 0x01) -> Data {
+    /// Shared mapping for the six physical buttons. Wheel click is Middle, not a seventh button.
+    static let uiButtonSlots = [0, 1, 2, 5, 4, 3]
+
+    static func encodeButtons(_ actions: [UInt8], profile: UInt8 = 0x01, preserving original: Data? = nil) -> Data {
         var buf = [UInt8](repeating: 0, count: 64)
+        if let original, decodeButtons(original) != nil {
+            for i in 0..<min(original.count, buf.count) { buf[i] = original[i] }
+        }
         buf[0] = buttonReportID
         buf[1] = buttonCommand
         buf[2] = profile
         for i in 0..<min(18, actions.count) {
+            if buf[3 + i * 3] != actions[i] {
+                buf[4 + i * 3] = 0
+                buf[5 + i * 3] = 0
+            }
             buf[3 + i * 3] = actions[i]
         }
         var sum: UInt16 = 0
@@ -184,7 +198,8 @@ enum BekenCodec {
     }
 
     static func decodeButtons(_ data: Data) -> [UInt8]? {
-        guard data.count >= 59, data[0] == buttonReportID else { return nil }
+        guard data.count >= 59, data[0] == buttonReportID, data[1] == buttonCommand,
+              checksum(data, from: 3, through: 56, at: 57) else { return nil }
         var actions = [UInt8]()
         for i in 0..<18 {
             actions.append(data[3 + i * 3])
@@ -210,6 +225,7 @@ enum BekenCodec {
         case .dpiDown: return 0x0F
         case .profileCycle: return 0x10
         case .shortcut, .macro: return 0x01
+        case .unknown(let code): return code
         }
     }
 
@@ -221,10 +237,15 @@ enum BekenCodec {
         case 0x05: return .backward
         case 0x06: return .forward
         case 0x0D: return .dpiCycle
+        case 0x07: return .doubleClick
+        case 0x08: return .fireButton
+        case 0x0E: return .dpiUp
+        case 0x0F: return .dpiDown
+        case 0x10: return .profileCycle
         case 10: return .scrollUp
         case 9: return .scrollDown
         case 0x01: return .off
-        default: return .off
+        default: return .unknown(code)
         }
     }
 
@@ -310,6 +331,31 @@ enum BekenCodec {
 
     static func bytesToDPI(_ lo: UInt8, _ hi: UInt8) -> Int {
         let v = (Int(hi) << 8) | Int(lo)
-        return v == 0 ? 0 : v * 50 + 50
+        return v * 50 + 50
+    }
+
+    private static func checksum(_ data: Data, from start: Int, through end: Int, at offset: Int) -> Bool {
+        let sum = data[start...end].reduce(UInt16(0)) { $0 &+ UInt16($1) }
+        return data[offset] == UInt8(sum >> 8) && data[offset + 1] == UInt8(sum & 0xFF)
+    }
+
+    /// Accept only the requested response, including an optional 8K outer report ID.
+    static func response(from data: Data, reportID: UInt8) -> Data? {
+        let bytes = Data(data)
+        let candidates = [bytes, Data(bytes.dropFirst())]
+        for (index, packet) in candidates.enumerated() {
+            if index == 1 && bytes.first != outputReportID8K { continue }
+            let valid: Bool
+            switch reportID {
+            case dpiReportID: valid = decodeDPI(packet) != nil
+            case rateReportID: valid = decodeRate(packet) != nil
+            case paramReportID: valid = decodeParams(packet) != nil
+            case buttonReportID: valid = decodeButtons(packet) != nil
+            case batteryReportID: valid = decodeBattery(packet) != nil
+            default: valid = false
+            }
+            if valid { return packet }
+        }
+        return nil
     }
 }

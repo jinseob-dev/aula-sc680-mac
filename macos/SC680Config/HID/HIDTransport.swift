@@ -1,6 +1,113 @@
 import Foundation
 import IOKit.hid
 
+struct HIDConnectionInfo {
+    let identity: USBIdentity
+    let productName: String
+    let transportMode: TransportMode
+    let hasFeaturePath: Bool
+    let hasOutputPath: Bool
+}
+
+protocol DeviceSession: AnyObject {
+    var onDeviceRemoved: (() -> Void)? { get set }
+    func open(forceReopen: Bool) async throws -> HIDConnectionInfo
+    func unlock() async throws -> Bool
+    func send(_ packet: Data, outputOnly: Bool) async throws
+    func read(reportID: UInt8, length: Int) async throws -> Data
+}
+
+/// All HID calls and retry delays run on one worker queue, including removal handling.
+final class HIDClient: DeviceSession {
+    private let queue: DispatchQueue
+    private let transport: HIDTransport
+    var onDeviceRemoved: (() -> Void)?
+
+    init() {
+        let queue = DispatchQueue(label: "com.aula.sc680config.hid")
+        self.queue = queue
+        transport = HIDTransport(callbackQueue: queue)
+        transport.onDeviceRemoved = { [weak self] in self?.onDeviceRemoved?() }
+    }
+
+    private func perform<T>(_ work: @escaping () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            queue.async {
+                do { continuation.resume(returning: try work()) }
+                catch { continuation.resume(throwing: error) }
+            }
+        }
+    }
+
+    private func ensureOpen(forceReopen: Bool = false) throws -> HIDConnectionInfo {
+        if !transport.isOpen || forceReopen {
+            var lastError: Error = HIDTransportError.deviceNotFound
+            var opened = false
+            for attempt in 0..<4 {
+                if attempt > 0 { Thread.sleep(forTimeInterval: 0.25 * Double(attempt)) }
+                do {
+                    try transport.openFirstMatching()
+                    opened = true
+                    break
+                } catch { lastError = error }
+            }
+            if !opened { throw lastError }
+        }
+        guard let identity = transport.identity else { throw HIDTransportError.deviceNotFound }
+        return HIDConnectionInfo(identity: identity, productName: transport.productName,
+                                 transportMode: transport.transportMode,
+                                 hasFeaturePath: transport.hasFeaturePath, hasOutputPath: transport.hasOutputPath)
+    }
+
+    func open(forceReopen: Bool) async throws -> HIDConnectionInfo {
+        try await perform { try self.ensureOpen(forceReopen: forceReopen) }
+    }
+
+    private func unlockOnQueue() throws -> Bool {
+        try ensureOpen()
+        if transport.hasFeaturePath {
+            try transport.sendFeatureUnlock()
+            Thread.sleep(forTimeInterval: 0.2)
+            return true
+        }
+        for packet in BekenCodec.unlockPackets() {
+            try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
+            Thread.sleep(forTimeInterval: 0.08)
+        }
+        return false
+    }
+
+    func unlock() async throws -> Bool {
+        try await perform { try self.unlockOnQueue() }
+    }
+
+    func send(_ packet: Data, outputOnly: Bool) async throws {
+        try await perform {
+            try self.ensureOpen()
+            let write = {
+                if outputOnly { try self.transport.send8KOutput(packet) }
+                else { try self.transport.sendBekenPacket(packet) }
+            }
+            do { try write() }
+            catch {
+                Thread.sleep(forTimeInterval: 0.35)
+                try self.ensureOpen(forceReopen: true)
+                // A newly opened receiver must be unlocked before retrying the write.
+                _ = try self.unlockOnQueue()
+                try write()
+            }
+            Thread.sleep(forTimeInterval: 0.08)
+        }
+    }
+
+    func read(reportID: UInt8, length: Int) async throws -> Data {
+        try await perform {
+            try self.ensureOpen()
+            return try self.transport.readBekenPacket(reportID: reportID, length: length)
+        }
+    }
+}
+
 enum HIDTransportError: Error, LocalizedError {
     case deviceNotFound
     case openFailed(String)
@@ -30,6 +137,11 @@ enum TransportMode: String {
 /// Without Feature unlock (`0x80`), Output DPI writes can return success at the HID
 /// layer while the mouse firmware ignores them — which looks like “no error, not applied”.
 final class HIDTransport {
+    private let callbackQueue: DispatchQueue
+
+    init(callbackQueue: DispatchQueue = .main) {
+        self.callbackQueue = callbackQueue
+    }
     private var manager: IOHIDManager?
     private var outputDevice: IOHIDDevice?
     private var featureDevice: IOHIDDevice?
@@ -40,7 +152,7 @@ final class HIDTransport {
     private(set) var hasFeaturePath: Bool = false
     private(set) var hasOutputPath: Bool = false
 
-    /// Called on the main queue when the open device is removed.
+    /// Called on callbackQueue when one of the selected interfaces is removed.
     var onDeviceRemoved: (() -> Void)?
 
     var isOpen: Bool { outputDevice != nil || featureDevice != nil }
@@ -83,8 +195,6 @@ final class HIDTransport {
             throw HIDTransportError.openFailed(String(format: "IOHIDManagerOpen 0x%08X (USB permission or restart Mac)", openKr))
         }
 
-        RunLoop.current.run(mode: .default, before: Date().addingTimeInterval(0.05))
-
         guard let set = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, !set.isEmpty else {
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             IOHIDManagerUnscheduleFromRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
@@ -107,6 +217,11 @@ final class HIDTransport {
             sawKnownVIDPID = true
             let page = intProperty(candidate, kIOHIDPrimaryUsagePageKey)
             guard (page & 0xFF00) == 0xFF00 else { continue }
+            // Never pair the Output collection of one receiver with another receiver's Feature collection.
+            if let selected = openedOutput ?? openedFeature {
+                guard match == selected.1,
+                      intProperty(candidate, kIOHIDLocationIDKey) == intProperty(selected.0, kIOHIDLocationIDKey) else { continue }
+            }
 
             let shared = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeNone))
             var opened = shared == kIOReturnSuccess
@@ -176,11 +291,11 @@ final class HIDTransport {
             transportMode = .feature
         }
 
-        IOHIDManagerRegisterDeviceRemovalCallback(mgr, { context, _, _, _ in
+        IOHIDManagerRegisterDeviceRemovalCallback(mgr, { context, _, _, removedDevice in
             guard let context else { return }
             let transport = Unmanaged<HIDTransport>.fromOpaque(context).takeUnretainedValue()
-            DispatchQueue.main.async {
-                transport.handleRemoval()
+            transport.callbackQueue.async {
+                transport.handleRemoval(removedDevice)
             }
         }, Unmanaged.passUnretained(self).toOpaque())
 
@@ -243,7 +358,8 @@ final class HIDTransport {
         }
     }
 
-    private func handleRemoval() {
+    private func handleRemoval(_ removedDevice: IOHIDDevice) {
+        guard removedDevice === outputDevice || removedDevice === featureDevice else { return }
         if let outputDevice {
             IOHIDDeviceClose(outputDevice, IOOptionBits(kIOHIDOptionsTypeNone))
         }
@@ -342,14 +458,15 @@ final class HIDTransport {
 
         do {
             let data = try getFeatureReport(reportID: reportID, length: length)
-            if data.count > 1, data.dropFirst().contains(where: { $0 != 0 }) {
-                return data
-            }
-            if data.first == reportID { return data }
+            if let response = BekenCodec.response(from: data, reportID: reportID) { return response }
         } catch {
             // fall through
         }
-        return try getInputReport(reportID: BekenCodec.outputReportID8K, length: BekenCodec.outputLength8K)
+        let data = try getInputReport(reportID: BekenCodec.outputReportID8K, length: BekenCodec.outputLength8K)
+        guard let response = BekenCodec.response(from: data, reportID: reportID) else {
+            throw HIDTransportError.reportFailed("no valid response for report 0x\(String(reportID, radix: 16))")
+        }
+        return response
     }
 
     func getInputReport(reportID: UInt8, length: Int) throws -> Data {
