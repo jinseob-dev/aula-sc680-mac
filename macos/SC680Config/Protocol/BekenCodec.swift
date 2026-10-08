@@ -31,6 +31,21 @@ enum BekenCodec {
         ]
     }
 
+    /// Windows WriteUSB path: 52-byte DPI struct padded to 64, report id 0x04.
+    static func encodeDPIOutput64(
+        slots: [Int],
+        activeIndex: Int,
+        colors: [(UInt8, UInt8, UInt8)],
+        enabledMask: UInt8 = 0xFF
+    ) -> Data {
+        wrapFor8KOutput(encodeDPI(slots: slots, activeIndex: activeIndex, colors: colors, enabledMask: enabledMask))
+    }
+
+    /// Commit/apply poke used by OEM after config writes (report 0x0C, or wrapped on 8K).
+    static func encodeApplyCommit() -> Data {
+        Data([applyReportID, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
+    }
+
     // MARK: - DPI
 
     static func encodeDPI(slots: [Int], activeIndex: Int, colors: [(UInt8, UInt8, UInt8)], enabledMask: UInt8 = 0xFF) -> Data {

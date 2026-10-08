@@ -82,8 +82,9 @@ final class HIDTransport {
         let ranked = set.sorted { score($0) > score($1) }
         var lastOpenError: kern_return_t = kIOReturnError
         var sawKnownVIDPID = false
+        var fallback: (IOHIDDevice, USBIdentity, Int)?
 
-        // Pass 1: vendor usage pages (config). Pass 2: any interface on the dongle.
+        // Prefer an interface that accepts Output report 0x04 (Windows WriteUSB path).
         for requireVendorPage in [true, false] {
             for candidate in ranked {
                 let vid = intProperty(candidate, kIOHIDVendorIDKey)
@@ -97,20 +98,39 @@ final class HIDTransport {
                 if requireVendorPage && !isVendor { continue }
                 if !requireVendorPage && isVendor { continue }
 
-                // Prefer shared open first. Seize often fails while the pointer
-                // interface is owned by WindowServer / another app.
                 let shared = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeNone))
-                if shared == kIOReturnSuccess {
-                    return finishOpen(mgr: mgr, candidate: candidate, match: match, page: page)
+                var opened = shared == kIOReturnSuccess
+                if !opened {
+                    lastOpenError = shared
+                    let seized = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
+                    opened = seized == kIOReturnSuccess
+                    if !opened {
+                        lastOpenError = seized
+                        continue
+                    }
                 }
-                lastOpenError = shared
 
-                let seized = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeSeizeDevice))
-                if seized == kIOReturnSuccess {
-                    return finishOpen(mgr: mgr, candidate: candidate, match: match, page: page)
+                // Probe Output 0x04 / 64 — required for 8K DPI writes.
+                if match == SC680DeviceIDs.dongle8K {
+                    if probeOutput8K(candidate) {
+                        if let (extra, _, _) = fallback {
+                            IOHIDDeviceClose(extra, IOOptionBits(kIOHIDOptionsTypeNone))
+                            fallback = nil
+                        }
+                        return finishOpen(mgr: mgr, candidate: candidate, match: match, page: page, mode: .output8K)
+                    }
+                    // Keep first openable interface as fallback; try other collections.
+                    if fallback == nil { fallback = (candidate, match, page) }
+                    else { IOHIDDeviceClose(candidate, IOOptionBits(kIOHIDOptionsTypeNone)) }
+                    continue
                 }
-                lastOpenError = seized
+
+                return finishOpen(mgr: mgr, candidate: candidate, match: match, page: page, mode: .feature)
             }
+        }
+
+        if let (candidate, match, page) = fallback {
+            return finishOpen(mgr: mgr, candidate: candidate, match: match, page: page, mode: .output8K)
         }
 
         IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -127,13 +147,34 @@ final class HIDTransport {
         throw HIDTransportError.deviceNotFound
     }
 
-    private func finishOpen(mgr: IOHIDManager, candidate: IOHIDDevice, match: USBIdentity, page: Int) -> USBIdentity {
+    private func probeOutput8K(_ candidate: IOHIDDevice) -> Bool {
+        var probe = [UInt8](repeating: 0, count: BekenCodec.outputLength8K)
+        probe[0] = BekenCodec.outputReportID8K
+        let kr = probe.withUnsafeMutableBufferPointer { buf in
+            IOHIDDeviceSetReport(
+                candidate,
+                kIOHIDReportTypeOutput,
+                CFIndex(BekenCodec.outputReportID8K),
+                buf.baseAddress!,
+                buf.count
+            )
+        }
+        return kr == kIOReturnSuccess
+    }
+
+    private func finishOpen(
+        mgr: IOHIDManager,
+        candidate: IOHIDDevice,
+        match: USBIdentity,
+        page: Int,
+        mode: TransportMode
+    ) -> USBIdentity {
         manager = mgr
         device = candidate
         identity = match
         usagePage = page
         productName = stringProperty(candidate, kIOHIDProductKey) ?? match.label
-        transportMode = (match == SC680DeviceIDs.dongle8K) ? .output8K : .feature
+        transportMode = mode
 
         IOHIDManagerRegisterDeviceRemovalCallback(mgr, { context, _, _, _ in
             guard let context else { return }

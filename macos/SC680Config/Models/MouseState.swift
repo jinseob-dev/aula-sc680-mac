@@ -307,10 +307,45 @@ final class DeviceStore: ObservableObject {
             let colors: [(UInt8, UInt8, UInt8)] = dpiSlots.map {
                 (UInt8(clamping: Int($0.red * 255)), UInt8(clamping: Int($0.green * 255)), UInt8(clamping: Int($0.blue * 255)))
             }
-            let packet = BekenCodec.encodeDPI(slots: values, activeIndex: activeDPIIndex, colors: colors, enabledMask: mask == 0 ? 0x1F : mask)
-            try transport.sendBekenPacket(packet)
+            let enabled = mask == 0 ? UInt8(0x1F) : mask
+
+            // 8K confirmed path = WriteUSB 64-byte Output report 0x04 (see docs/fixtures/dpi_write_64.hex).
+            if transport.identity == SC680DeviceIDs.dongle8K || transport.transportMode == .output8K {
+                let out = BekenCodec.encodeDPIOutput64(
+                    slots: values,
+                    activeIndex: activeDPIIndex,
+                    colors: colors,
+                    enabledMask: enabled
+                )
+                try transport.send8KOutput(out)
+            } else {
+                let packet = BekenCodec.encodeDPI(
+                    slots: values,
+                    activeIndex: activeDPIIndex,
+                    colors: colors,
+                    enabledMask: enabled
+                )
+                try transport.sendBekenPacket(packet)
+            }
             Thread.sleep(forTimeInterval: 0.08)
+            try sendApplyCommit()
         }
+    }
+
+    /// OEM commit after config writes. Best-effort — some firmwares ignore 0x0C.
+    func sendApplyCommit() throws {
+        let packet = BekenCodec.encodeApplyCommit()
+        do {
+            if transport.identity == SC680DeviceIDs.dongle8K || transport.transportMode == .output8K {
+                try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
+            } else {
+                try transport.sendBekenPacket(packet)
+            }
+        } catch {
+            // Non-fatal: DPI/rate frames are accepted without an explicit apply on many builds.
+            NSLog("SC680Config apply commit skipped: %@", String(describing: error))
+        }
+        Thread.sleep(forTimeInterval: 0.05)
     }
 
     func applyPolling() throws {
@@ -401,11 +436,20 @@ final class DeviceStore: ObservableObject {
     }
 
     func sendUnlock() throws {
-        try performTransfer {
-            for packet in BekenCodec.unlockPackets() {
-                try transport.sendBekenPacket(packet)
-                Thread.sleep(forTimeInterval: 0.08)
+        try ensureOpen()
+        // Unlock must not block DPI on 8K: Feature 0x80 often returns 0xE0005000
+        // on the Output-only interface. Prefer wrapped Output; ignore failures.
+        for packet in BekenCodec.unlockPackets() {
+            do {
+                if transport.identity == SC680DeviceIDs.dongle8K || transport.transportMode == .output8K {
+                    try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
+                } else {
+                    try transport.sendBekenPacket(packet)
+                }
+            } catch {
+                NSLog("SC680Config unlock soft-fail: %@", String(describing: error))
             }
+            Thread.sleep(forTimeInterval: 0.08)
         }
     }
 
