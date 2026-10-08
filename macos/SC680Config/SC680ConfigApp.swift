@@ -16,6 +16,9 @@ struct SC680ConfigApp: App {
                 Button("Rescan") { Task { await store.refreshConnection() } }
                     .disabled(store.isBusy)
                     .keyboardShortcut("r", modifiers: [.command])
+                Button("Copy Connection Details") { Task { await store.copyConnectionDetails() } }
+                    .disabled(store.isBusy)
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
                 Button("Apply All") { Task { await store.applyAll() } }
                     .disabled(store.isBusy)
                     .keyboardShortcut(.return, modifiers: [.command])

@@ -20,3 +20,13 @@ jobs:
           ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
       - name: Run regression tests
         run: bash macos/scripts/run-regression-tests.sh
+      - name: Run UI rendering regressions
+        timeout-minutes: 3
+        run: bash macos/scripts/run-ui-regression-tests.sh
+      - name: Upload UI rendering evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ui-rendering-evidence
+          path: macos/build/ui-regressions/*.png
+          if-no-files-found: ignore
