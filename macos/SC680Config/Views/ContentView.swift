@@ -5,13 +5,21 @@ struct ContentView: View {
     @EnvironmentObject private var store: DeviceStore
     @State private var tab: SidebarTab = .buttons
 
+    init(initialTab: SidebarTab = .buttons) {
+        _tab = State(initialValue: initialTab)
+    }
+
+    private var selection: Binding<SidebarTab?> {
+        Binding(get: { tab }, set: { if let value = $0 { tab = value } })
+    }
+
     var body: some View {
-        NavigationSplitView {
-            List(SidebarTab.allCases, selection: $tab) { item in
+        HSplitView {
+            List(SidebarTab.allCases, selection: selection) { item in
                 Label(item.title, systemImage: item.icon)
                     .tag(item)
             }
-            .navigationSplitViewColumnWidth(200)
+            .frame(minWidth: 200, idealWidth: 220, maxWidth: 280)
             .safeAreaInset(edge: .bottom) {
                 VStack(alignment: .leading, spacing: 8) {
                     Text(store.connection.rawValue)
@@ -31,13 +39,7 @@ struct ContentView: View {
                         .disabled(store.isBusy)
                         .buttonStyle(.borderedProminent)
                     Button("Copy Connection Details") {
-                        Task {
-                            await store.captureConnectionDetails()
-                            let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
-                            let details = "SC680Config \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\nStatus: \(store.statusText)\n\(store.connectionDetails)"
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(details, forType: .string)
-                        }
+                        Task { await store.copyConnectionDetails(context: "Page: \(tab.title)") }
                     }
                     .disabled(store.isBusy)
                     .font(.caption)
@@ -45,7 +47,6 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
             }
-        } detail: {
             VStack(spacing: 0) {
                 header
                 Divider()
@@ -61,10 +62,14 @@ struct ContentView: View {
                     case .profiles: ProfileSettingsView()
                     }
                 }
+                .id(tab)
                 .disabled(store.isBusy)
+                .frame(minHeight: 360)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                .layoutPriority(1)
                 .padding()
             }
+            .frame(minWidth: 680, maxWidth: .infinity, maxHeight: .infinity)
         }
         .task {
             // One-shot connect on first appear; avoid re-opening on every view refresh.
@@ -82,16 +87,22 @@ struct ContentView: View {
                 Text(store.statusText)
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .lineLimit(3)
+                    .truncationMode(.tail)
+                    .textSelection(.enabled)
+                    .help(store.statusText)
             }
-            Spacer()
-            Button(store.isBusy ? "Working…" : "Apply") { Task { await store.applyAll() } }
-                .disabled(store.isBusy)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .layoutPriority(1)
+            Button(store.isBusy ? "Working…" : tab.settingsSection.map { "Apply \($0.rawValue)" } ?? "Apply") {
+                if let section = tab.settingsSection { Task { await store.applyOnly(section) } }
+            }
+                .disabled(store.isBusy || tab.settingsSection == nil)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-                .keyboardShortcut(.return, modifiers: [.command])
         }
         .padding()
+        .frame(maxHeight: 120)
     }
 }
 
@@ -109,6 +120,17 @@ enum SidebarTab: String, CaseIterable, Identifiable {
         case .power: return "Power"
         case .macros: return "Macros"
         case .profiles: return "Profiles"
+        }
+    }
+
+    var settingsSection: SettingsSection? {
+        switch self {
+        case .buttons: return .buttons
+        case .dpi: return .dpi
+        case .light: return .light
+        case .polling: return .polling
+        case .performance: return .parameters
+        case .power, .macros, .profiles: return nil
         }
     }
 

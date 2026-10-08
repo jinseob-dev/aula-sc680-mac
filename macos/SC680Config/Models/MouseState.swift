@@ -249,6 +249,14 @@ final class DeviceStore: ObservableObject {
         }
     }
 
+    func copyConnectionDetails(context: String = "Device menu") async {
+        await captureConnectionDetails()
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let details = "SC680Config \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\n\(context)\nBusy: \(isBusy)\nStatus: \(statusText)\n\(connectionDetails)"
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(details, forType: .string)
+    }
+
     private func updateReceiverPower() async {
         guard connection != .none, let power = await session.receiverPower(), connection != .none else { return }
         batteryPercent = power.batteryPercent
