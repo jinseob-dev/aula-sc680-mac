@@ -2,27 +2,88 @@ name: macOS installer
 
 on:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish the validated installer as a GitHub release
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - macos/SC680Config/Info.plist
+      - macos/SC680Config.xcodeproj/project.pbxproj
+      - .github/workflows/macos-installer.yml
   push:
+    branches:
+      - master
     tags:
       - "v*"
+    paths:
+      - macos/SC680Config/Info.plist
+      - macos/SC680Config.xcodeproj/project.pbxproj
+      - .github/workflows/macos-installer.yml
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: macos-installer-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-dmg:
     runs-on: macos-14
+    outputs:
+      tag: ${{ steps.metadata.outputs.tag }}
+      artifact_base: ${{ steps.metadata.outputs.artifact_base }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Validate release version
+        id: metadata
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' macos/SC680Config/Info.plist)"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' macos/SC680Config/Info.plist)"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$BUILD" =~ ^[0-9]+$ ]]
+          if [[ "$REF_TYPE" == "tag" ]]; then
+            [[ "$REF_NAME" == "v$VERSION" ]]
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "artifact_base=SC680Config-$VERSION-build$BUILD-macOS-arm64" >> "$GITHUB_OUTPUT"
+
+      - name: Run regression tests
+        run: bash macos/scripts/run-regression-tests.sh
 
       - name: Build DMG and ZIP
         working-directory: macos
         env:
           CODE_SIGN_IDENTITY: "-"
+        run: bash scripts/make-installer.sh
+
+      - name: Verify installer and app bundle
+        working-directory: macos
+        env:
+          ARTIFACT_BASE: ${{ steps.metadata.outputs.artifact_base }}
         run: |
-          chmod +x scripts/make-installer.sh
-          ./scripts/make-installer.sh
+          APP="build/DerivedData/Build/Products/Release/SC680Config.app"
+          [[ "$(lipo -archs "$APP/Contents/MacOS/SC680Config")" == "arm64" ]]
+          codesign --verify --deep --strict "$APP"
+          VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' SC680Config/Info.plist)"
+          BUILD="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' SC680Config/Info.plist)"
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP/Contents/Info.plist")" == "$VERSION" ]]
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$APP/Contents/Info.plist")" == "$BUILD" ]]
+          hdiutil verify "build/$ARTIFACT_BASE.dmg"
+          EXTRACTED="$(mktemp -d)"
+          trap 'rm -rf "$EXTRACTED"' EXIT
+          ditto -x -k "build/$ARTIFACT_BASE.zip" "$EXTRACTED"
+          codesign --verify --deep --strict "$EXTRACTED/SC680Config.app"
+          [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$EXTRACTED/SC680Config.app/Contents/Info.plist")" == "$VERSION" ]]
+          cd build
+          shasum -a 256 "$ARTIFACT_BASE.dmg" "$ARTIFACT_BASE.zip" > SHA256SUMS
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -31,13 +92,58 @@ jobs:
           path: |
             macos/build/*.dmg
             macos/build/*.zip
+            macos/build/SHA256SUMS
           if-no-files-found: error
 
-      - name: Attach to GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  publish:
+    needs: build-dmg
+    if: >-
+      (github.event_name == 'push' &&
+       (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish &&
+       (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v')))
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
         with:
-          files: |
-            macos/build/*.dmg
-            macos/build/*.zip
-          generate_release_notes: true
+          name: SC680Config-macos-arm64
+          path: release-assets
+
+      - name: Verify uploaded checksums
+        working-directory: release-assets
+        run: sha256sum -c SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ needs.build-dmg.outputs.tag }}
+          ARTIFACT_BASE: ${{ needs.build-dmg.outputs.artifact_base }}
+          RELEASE_COMMIT: ${{ github.sha }}
+        run: |
+          NOTES="docs/releases/$RELEASE_TAG.md"
+          if [[ ! -f "$NOTES" ]]; then
+            echo "Missing release notes: $NOTES" >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            [[ "$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft')" == "true" ]]
+            [[ "$(gh release view "$RELEASE_TAG" --json targetCommitish --jq '.targetCommitish')" == "$RELEASE_COMMIT" ]]
+            gh release upload "$RELEASE_TAG" \
+              "release-assets/$ARTIFACT_BASE.dmg" \
+              "release-assets/$ARTIFACT_BASE.zip" \
+              release-assets/SHA256SUMS --clobber
+          else
+            gh release create "$RELEASE_TAG" \
+              "release-assets/$ARTIFACT_BASE.dmg" \
+              "release-assets/$ARTIFACT_BASE.zip" \
+              release-assets/SHA256SUMS \
+              --target "$RELEASE_COMMIT" --title "$RELEASE_TAG" \
+              --notes-file "$NOTES" --draft
+          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest \
+            --title "$RELEASE_TAG" --notes-file "$NOTES"
