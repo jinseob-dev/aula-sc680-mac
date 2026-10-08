@@ -236,6 +236,14 @@ final class DeviceStore: ObservableObject {
             rawButtons = nil
             await syncFromDevice()
         } catch { markDisconnected(reason: error.localizedDescription) }
+        await captureConnectionDetails()
+    }
+
+    private func captureConnectionDetails() async {
+        let details = await session.diagnostics()
+        if !details.isEmpty {
+            connectionDetails = "Transport: \(lastTransport)\n" + details
+        }
     }
 
     private func updateConnection(_ info: HIDConnectionInfo) {
@@ -334,6 +342,7 @@ final class DeviceStore: ObservableObject {
             let prefix = written.isEmpty ? "Apply failed" : "Partial apply (\(written.joined(separator: ", ")) already sent)"
             statusText = "\(prefix): \(error.localizedDescription)"
         }
+        await captureConnectionDetails()
     }
 
     private func applyDPI() async throws -> String? {

@@ -1,4 +1,4 @@
-# AULA SC680 8K — HID Protocol (confirmed)
+# AULA SC680 8K — HID protocol evidence and remaining gaps
 
 Interoperability notes for rebuilding the Windows OEM configurator on macOS.
 
@@ -22,7 +22,7 @@ Open_ReportDevice => 1
 
 ## Command format (confirmed in `Mouse.exe`)
 
-Identical to libratbag Beken BK3633 (`driver-beken.c`). Machine code builds:
+These packet layouts match the proposed Beken BK3633 driver in [libratbag PR #1849](https://github.com/libratbag/libratbag/pull/1849). This is a reference for packet layout, not proof that SC680 firmware supports that driver’s Feature reads. OEM machine code builds:
 
 | Report ID | Command byte | Purpose | Struct size |
 |-----------|--------------|---------|-------------|
@@ -93,7 +93,11 @@ Checksum: sum of bytes `[3..56]` as u16 BE at `[57..58]`.
 - Native DPI packet already starts with `0x04` → send padded to 64 bytes.
 - Packets whose Beken report id ≠ `0x04` (rate/param/button): send as  
   **`[0x04] + full_beken_packet...` padded to 64**, **or** `SetFeature(beken_packet)` when the Feature collection accepts it (wired / some dongles).
-- macOS opens Feature and Output collections on the same receiver. It unlocks via Feature `0x80`, sends 8K configuration through Output `0x04`/64, and validates the requested response before reporting verified success. Feature fallback is used if an Output write fails. The exact report descriptors and firmware behavior must still be checked on hardware.
+- A user hardware log from macOS 27.0.1 / SC680Config 1.0.7 confirms shared open succeeds on a compound Generic Desktop primary interface with vendor usages and Output `0x04`/64. No Feature elements were exposed (`Feature=[]`, maximum size 1). All configuration reads failed. Opening `Open_FeatureDevice` in the Windows DLL is not proof that Feature `0x80` exists in this receiver’s descriptor.
+- On receivers that expose Feature `0x80`, macOS can use that unlock path. Otherwise the existing Output-wrapped unlock is unconfirmed; successful USB transfer does not prove firmware acceptance.
+- Version 1.0.8 adds interrupt Input `0x04` reception as an alternative to control `GET_REPORT`, but only when Input `0x04` is present in the descriptor. It accepts only validated requested responses and rejects responses older than the latest Output write/open. Scan sends no guessed read commands or settings writes.
+- Windows verification establishes accepted write framing, not the read-request sequence or firmware persistence. The actual 8K read-request/response protocol remains unverified. If no valid Input response arrives, obtain an OEM capture including requests and replies before implementing a new request envelope. Do not send an all-zero DPI structure as a read request: it can be a destructive settings write.
+- Copied connection details include Input/Output/Feature IDs and sizes, the configuration interface’s raw report descriptor, actual read errors, and a bounded vendor Input `0x04` prefix/count. Mouse/keyboard input reports are ignored.
 
 ## Capture tooling
 

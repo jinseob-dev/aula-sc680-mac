@@ -16,6 +16,11 @@ protocol DeviceSession: AnyObject {
     func unlock() async throws -> Bool
     func send(_ packet: Data, outputOnly: Bool) async throws
     func read(reportID: UInt8, length: Int) async throws -> Data
+    func diagnostics() async -> String
+}
+
+extension DeviceSession {
+    func diagnostics() async -> String { "" }
 }
 
 /// All HID calls and retry delays run on one worker queue, including removal handling.
@@ -107,6 +112,10 @@ final class HIDClient: DeviceSession {
         }
     }
 
+    func diagnostics() async -> String {
+        (try? await perform { self.transport.diagnostics }) ?? ""
+    }
+
     func read(reportID: UInt8, length: Int) async throws -> Data {
         try await perform {
             try self.ensureOpen()
@@ -163,12 +172,52 @@ final class HIDTransport {
     private(set) var hasOutputPath: Bool = false
     private(set) var connectionDiagnostics: String = ""
 
+    private var responseInbox = HIDResponseInbox()
+    private let inputBuffer = UnsafeMutablePointer<UInt8>.allocate(capacity: 64)
+    private var inputListening = false
+    private var selectedOutputInfo: HIDInterfaceInfo?
+    private var minimumResponseTime = ProcessInfo.processInfo.systemUptime
+    private var readTrace: [String] = []
+
+    var diagnostics: String {
+        connectionDiagnostics + "\n" + responseInbox.summary + "\n" + readTrace.joined(separator: "\n")
+    }
+
+    private func onMain(_ work: () -> Void) {
+        if Thread.isMainThread { work() }
+        else { DispatchQueue.main.sync(execute: work) }
+    }
+
+    private func stopInputListener() {
+        guard inputListening, let outputDevice else { return }
+        onMain {
+            IOHIDDeviceRegisterInputReportCallback(outputDevice, inputBuffer, 64, nil, nil)
+            IOHIDDeviceUnscheduleFromRunLoop(outputDevice, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        }
+        inputListening = false
+    }
+
+    private func startInputListener() {
+        guard let outputDevice, selectedOutputInfo?.inputReportIDs.contains(4) == true else { return }
+        onMain {
+            IOHIDDeviceRegisterInputReportCallback(outputDevice, inputBuffer, 64, { context, result, _, type, reportID, report, length in
+                guard let context, result == kIOReturnSuccess, type == kIOHIDReportTypeInput,
+                      reportID == 4, length > 0, length <= 64 else { return }
+                let transport = Unmanaged<HIDTransport>.fromOpaque(context).takeUnretainedValue()
+                transport.responseInbox.record(reportID: Int(reportID), data: Data(bytes: report, count: length))
+            }, Unmanaged.passUnretained(self).toOpaque())
+            IOHIDDeviceScheduleWithRunLoop(outputDevice, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
+        }
+        inputListening = true
+    }
+
     /// Called on callbackQueue when one of the selected interfaces is removed.
     var onDeviceRemoved: (() -> Void)?
 
     var isOpen: Bool { outputDevice != nil || featureDevice != nil }
 
     func close() {
+        stopInputListener()
         if let outputDevice {
             IOHIDDeviceClose(outputDevice, IOOptionBits(kIOHIDOptionsTypeNone))
         }
@@ -190,12 +239,19 @@ final class HIDTransport {
         hasOutputPath = false
     }
 
-    deinit { close() }
+    deinit {
+        close()
+        inputBuffer.deallocate()
+    }
 
     @discardableResult
     func openFirstMatching() throws -> USBIdentity {
         close()
         connectionDiagnostics = ""
+        responseInbox = HIDResponseInbox()
+        readTrace = []
+        selectedOutputInfo = nil
+        minimumResponseTime = ProcessInfo.processInfo.systemUptime
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
         IOHIDManagerSetDeviceMatchingMultiple(mgr, matchingDictionaries() as CFArray)
         IOHIDManagerScheduleWithRunLoop(mgr, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
@@ -233,6 +289,9 @@ final class HIDTransport {
             let shared = IOHIDDeviceOpen(candidate, IOOptionBits(kIOHIDOptionsTypeNone))
             let info = interfaceInfo(candidate)
             observations.append("\(match.label) \(info.summary); sharedOpen=\(String(format: "0x%08X", shared))")
+            if info.supports8KOutput, let descriptor = IOHIDDeviceGetProperty(candidate, kIOHIDReportDescriptorKey as CFString) as? Data {
+                observations.append("ReportDescriptor: " + descriptor.prefix(4096).map { String(format: "%02X", $0) }.joined(separator: " "))
+            }
             guard shared == kIOReturnSuccess else {
                 openErrors.append(shared)
                 continue
@@ -268,6 +327,7 @@ final class HIDTransport {
         }
         manager = mgr
         outputDevice = openedOutput?.0
+        selectedOutputInfo = openedOutput?.2
         featureDevice = openedFeature?.0
         identity = selected.1
         usagePage = selected.2.primaryUsagePage
@@ -276,6 +336,7 @@ final class HIDTransport {
         hasFeaturePath = openedFeature?.2.supportsFeatureUnlock == true
         transportMode = hasOutputPath ? (hasFeaturePath ? .dual8K : .output8K) : .feature
 
+        startInputListener()
         IOHIDManagerRegisterDeviceRemovalCallback(mgr, { context, _, _, removedDevice in
             guard let context else { return }
             let transport = Unmanaged<HIDTransport>.fromOpaque(context).takeUnretainedValue()
@@ -305,6 +366,7 @@ final class HIDTransport {
                 if let page = pair[kIOHIDDeviceUsagePageKey] as? NSNumber { pages.insert(page.intValue) }
             }
         }
+        var inputIDs = Set<Int>()
         var outputIDs = Set<Int>()
         var featureIDs = Set<Int>()
         if let elements = IOHIDDeviceCopyMatchingElements(device, nil, IOOptionBits(kIOHIDOptionsTypeNone)) as? [IOHIDElement] {
@@ -312,6 +374,8 @@ final class HIDTransport {
                 pages.insert(Int(IOHIDElementGetUsagePage(element)))
                 let reportID = Int(IOHIDElementGetReportID(element))
                 switch IOHIDElementGetType(element) {
+                case kIOHIDElementTypeInput_Misc, kIOHIDElementTypeInput_Button, kIOHIDElementTypeInput_Axis, kIOHIDElementTypeInput_ScanCodes:
+                    inputIDs.insert(reportID)
                 case kIOHIDElementTypeOutput: outputIDs.insert(reportID)
                 case kIOHIDElementTypeFeature: featureIDs.insert(reportID)
                 default: break
@@ -321,7 +385,8 @@ final class HIDTransport {
         return HIDInterfaceInfo(primaryUsagePage: intProperty(device, kIOHIDPrimaryUsagePageKey),
             usagePages: pages, outputReportIDs: outputIDs, featureReportIDs: featureIDs,
             maxOutputSize: intProperty(device, kIOHIDMaxOutputReportSizeKey),
-            maxFeatureSize: intProperty(device, kIOHIDMaxFeatureReportSizeKey))
+            maxFeatureSize: intProperty(device, kIOHIDMaxFeatureReportSizeKey),
+            inputReportIDs: inputIDs, maxInputSize: intProperty(device, kIOHIDMaxInputReportSizeKey))
     }
 
     private func matchingDictionaries() -> [[String: Any]] {
@@ -335,6 +400,7 @@ final class HIDTransport {
 
     private func handleRemoval(_ removedDevice: IOHIDDevice) {
         guard removedDevice === outputDevice || removedDevice === featureDevice else { return }
+        stopInputListener()
         if let outputDevice {
             IOHIDDeviceClose(outputDevice, IOOptionBits(kIOHIDOptionsTypeNone))
         }
@@ -414,6 +480,7 @@ final class HIDTransport {
         let n = min(packet.count, bytes.count)
         for i in 0..<n { bytes[i] = packet[i] }
         bytes[0] = BekenCodec.outputReportID8K
+        minimumResponseTime = ProcessInfo.processInfo.systemUptime
         let kr = bytes.withUnsafeMutableBufferPointer { buf in
             IOHIDDeviceSetReport(
                 outputDevice,
@@ -430,18 +497,32 @@ final class HIDTransport {
 
     func readBekenPacket(reportID: UInt8, length: Int) throws -> Data {
         guard isOpen else { throw HIDTransportError.openFailed("session closed — tap Rescan") }
+        var failures = [String]()
+        if featureDevice != nil {
+            do {
+                let data = try getFeatureReport(reportID: reportID, length: length)
+                if let response = BekenCodec.response(from: data, reportID: reportID) { return response }
+                failures.append("Feature returned an invalid response")
+            } catch { failures.append(error.localizedDescription) }
+        } else { failures.append("Feature report unavailable in receiver descriptor") }
 
-        do {
-            let data = try getFeatureReport(reportID: reportID, length: length)
-            if let response = BekenCodec.response(from: data, reportID: reportID) { return response }
-        } catch {
-            // fall through
-        }
-        let data = try getInputReport(reportID: BekenCodec.outputReportID8K, length: BekenCodec.outputLength8K)
-        guard let response = BekenCodec.response(from: data, reportID: reportID) else {
-            throw HIDTransportError.reportFailed("no valid response for report 0x\(String(reportID, radix: 16))")
-        }
-        return response
+        if selectedOutputInfo?.inputReportIDs.contains(4) == true {
+            do {
+                let data = try getInputReport(reportID: 4, length: 64)
+                if let response = BekenCodec.response(from: data, reportID: reportID) { return response }
+                failures.append("GET_REPORT Input 0x04 returned invalid response: " + data.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " "))
+            } catch { failures.append(error.localizedDescription) }
+            if let response = responseInbox.response(reportID: reportID, receivedAfter: minimumResponseTime, timeout: 0.35) {
+                readTrace.append("Read \(String(format: "0x%02X", reportID)): interrupt response")
+                if readTrace.count > 20 { readTrace.removeFirst(readTrace.count - 20) }
+                return response
+            }
+            failures.append("No valid interrupt response within 350 ms")
+        } else { failures.append("Input report 0x04 unavailable in receiver descriptor") }
+        let detail = "Read \(String(format: "0x%02X", reportID)): " + failures.joined(separator: "; ")
+        readTrace.append(detail)
+        if readTrace.count > 20 { readTrace.removeFirst(readTrace.count - 20) }
+        throw HIDTransportError.reportFailed(detail)
     }
 
     func getInputReport(reportID: UInt8, length: Int) throws -> Data {
