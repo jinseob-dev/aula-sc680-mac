@@ -215,7 +215,9 @@ final class DeviceStore: ObservableObject {
         if profileDocs.isEmpty { profileDocs = [snapshotProfile(name: "Profile 1")] }
         session.onDeviceRemoved = { [weak self] in
             Task { @MainActor in
-                guard let self, !self.isBusy else { return }
+                guard let self else { return }
+                self.rawButtons = nil
+                guard !self.isBusy else { return }
                 self.markDisconnected(reason: "Receiver disconnected — reconnect and tap Rescan")
             }
         }

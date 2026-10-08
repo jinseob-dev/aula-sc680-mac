@@ -39,6 +39,7 @@ final class HIDClient: DeviceSession {
         }
     }
 
+    @discardableResult
     private func ensureOpen(forceReopen: Bool = false) throws -> HIDConnectionInfo {
         if !transport.isOpen || forceReopen {
             var lastError: Error = HIDTransportError.deviceNotFound
@@ -83,7 +84,9 @@ final class HIDClient: DeviceSession {
 
     func send(_ packet: Data, outputOnly: Bool) async throws {
         try await perform {
+            let wasOpen = self.transport.isOpen
             try self.ensureOpen()
+            if !wasOpen { _ = try self.unlockOnQueue() }
             let write = {
                 if outputOnly { try self.transport.send8KOutput(packet) }
                 else { try self.transport.sendBekenPacket(packet) }
