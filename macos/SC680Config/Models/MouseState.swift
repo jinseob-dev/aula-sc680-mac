@@ -320,7 +320,7 @@ final class DeviceStore: ObservableObject {
             let info = try await session.open(forceReopen: false)
             updateConnection(info)
             if !(try await session.unlock()) {
-                notices.append("Feature unlock unavailable; receiver acceptance is unconfirmed")
+                notices.append("Receiver acceptance requires readback or a hardware check")
             }
             for section in sections {
                 let warning: String?
@@ -364,6 +364,9 @@ final class DeviceStore: ObservableObject {
     }
 
     private func sendApplyCommit() async -> String? {
+        if connection == .wireless8K {
+            return "Persistence after power-cycle is unverified"
+        }
         do {
             try await session.send(BekenCodec.encodeApplyCommit(), outputOnly: false)
             return nil
