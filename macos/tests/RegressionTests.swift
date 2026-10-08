@@ -9,6 +9,8 @@ final class MockSession: DeviceSession {
     var featureUnlock = true
     var failLight = false
     var openDelay: UInt64 = 0
+    var diagnosticText = ""
+    func diagnostics() async -> String { diagnosticText }
 
     func open(forceReopen: Bool) async throws -> HIDConnectionInfo {
         if openDelay > 0 { try await Task.sleep(nanoseconds: openDelay) }
@@ -78,6 +80,31 @@ struct RegressionTests {
         let fixture = try String(contentsOfFile: "docs/fixtures/dpi_write_64.hex", encoding: .utf8)
         let hex = fixture.split(separator: "\n").filter { !$0.hasPrefix("#") }.joined(separator: " ")
         let captured = Data(hex.split(whereSeparator: { $0.isWhitespace }).map { UInt8($0, radix: 16)! })
+        let inbox = HIDResponseInbox()
+        inbox.record(reportID: 4, data: captured, receivedAt: 100)
+        try check(inbox.response(reportID: 4, receivedAfter: 99, timeout: 0) == captured,
+                  "Read the requested valid interrupt response")
+        try check(inbox.response(reportID: 6, receivedAfter: 99, timeout: 0) == nil,
+                  "Do not route DPI interrupts to polling reads")
+        try check(inbox.response(reportID: 4, receivedAfter: 101, timeout: 0) == nil,
+                  "Never use a pre-write response to verify a new configuration")
+        let interruptRate = BekenCodec.encodeRate(hz: 500)
+        inbox.record(reportID: 4, data: Data(BekenCodec.wrapFor8KOutput(interruptRate).dropFirst()), receivedAt: 200)
+        try check(BekenCodec.decodeRate(inbox.response(reportID: 6, receivedAfter: 199, timeout: 0)!) == 500,
+                  "Handle callback payloads where IOKit supplies report ID separately")
+        inbox.record(reportID: 1, data: Data([1, 0, 0, 0, 0, 0, 50]), receivedAt: 201)
+        try check(inbox.response(reportID: 1, receivedAfter: 199, timeout: 0) == nil,
+                  "Ignore pointer and keyboard reports even if bytes resemble a battery packet")
+        var invalidInterrupt = captured; invalidInterrupt[50] ^= 1
+        inbox.record(reportID: 4, data: invalidInterrupt, receivedAt: 300)
+        try check(inbox.response(reportID: 4, receivedAfter: 299, timeout: 0) == nil,
+                  "Reject invalid interrupt checksums")
+        let bounded = HIDResponseInbox()
+        bounded.record(reportID: 4, data: captured, receivedAt: 100)
+        for i in 0..<17 { bounded.record(reportID: 4, data: Data([4, 0]), receivedAt: Double(101 + i)) }
+        try check(bounded.response(reportID: 4, receivedAfter: 99, timeout: 0) == nil,
+                  "Bound the interrupt queue and discard old reports")
+
         let decoded = BekenCodec.decodeDPI(captured)!
         try check(decoded.slots.prefix(5) == [400, 800, 1600, 3200, 6400], "Captured DPI values")
         try check(decoded.activeIndex == 1 && decoded.enabledMask == 0x1F, "Captured DPI stage/mask")
@@ -116,7 +143,9 @@ struct RegressionTests {
         original = BekenCodec.encodeButtons(hardware, preserving: checksumButtons(original))
         session.responses[0x08] = original
         let store = makeStore(session)
+        session.diagnosticText = "GET_REPORT Input 0x04 failed: 0xE00002E2"
         await store.refreshConnection()
+        try check(store.connectionDetails.contains("0xE00002E2"), "Expose actual read errors in copied diagnostics")
         try check(store.buttons.count == 6, "Wheel click must not become a duplicate seventh button")
         try check(store.buttons[3].action == .forward && store.buttons[4].action == .backward, "Forward/Back mapping")
         try check(!store.dpiSlots[5].enabled && !store.dpiSlots[7].enabled, "Disabled stages stay disabled")
@@ -187,7 +216,7 @@ struct RegressionTests {
         await busyStore.applyOnly(.polling)
         await first.value
         try check(delayed.writes.count == 1 && !busyStore.isBusy, "Prevent overlapping Apply operations and release busy state")
-        print("PASS: captured framing, response validation, button/DPI preservation, verification notices, profile validation, and async operation serialization")
+        print("PASS: interrupt routing/freshness, read diagnostics, captured framing, response validation, button/DPI preservation, verification notices, profile validation, and async operation serialization")
     }
 
     static func checksumButtons(_ data: Data) -> Data {

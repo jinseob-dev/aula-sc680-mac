@@ -35,6 +35,8 @@ struct HIDInterfaceInfo {
     let featureReportIDs: Set<Int>
     let maxOutputSize: Int
     let maxFeatureSize: Int
+    var inputReportIDs: Set<Int> = []
+    var maxInputSize: Int = 0
 
     var hasVendorCollection: Bool {
         usagePages.union([primaryUsagePage]).contains { ($0 & 0xFF00) == 0xFF00 }
@@ -55,6 +57,50 @@ struct HIDInterfaceInfo {
             values.sorted().map { String(format: "0x%X", $0) }.joined(separator: ",")
         }
         return "primary=\(String(format: "0x%X", primaryUsagePage)), usages=[\(hexList(usagePages))], " +
-            "Output=[\(hexList(outputReportIDs))]/\(maxOutputSize), Feature=[\(hexList(featureReportIDs))]/\(maxFeatureSize)"
+            "Input=[\(hexList(inputReportIDs))]/\(maxInputSize), Output=[\(hexList(outputReportIDs))]/\(maxOutputSize), Feature=[\(hexList(featureReportIDs))]/\(maxFeatureSize)"
+    }
+}
+
+
+/// Bounded, thread-safe inbox for vendor Input 0x04 responses. Pointer/keyboard
+/// reports are never retained. A write/open timestamp prevents stale verification.
+final class HIDResponseInbox {
+    private let condition = NSCondition()
+    private var frames: [(time: TimeInterval, data: Data)] = []
+    private var receivedCount = 0
+    private var lastPreview = "none"
+
+    func record(reportID: Int, data: Data, receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
+        guard reportID == Int(BekenCodec.outputReportID8K), !data.isEmpty, data.count <= 64 else { return }
+        condition.lock()
+        defer { condition.unlock() }
+        receivedCount += 1
+        lastPreview = data.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " ")
+        frames.append((receivedAt, data))
+        if frames.count > 16 { frames.removeFirst(frames.count - 16) }
+        condition.broadcast()
+    }
+
+    func response(reportID: UInt8, receivedAfter: TimeInterval, timeout: TimeInterval) -> Data? {
+        let deadline = Date(timeIntervalSinceNow: timeout)
+        condition.lock()
+        defer { condition.unlock() }
+        repeat {
+            for frame in frames.reversed() where frame.time >= receivedAfter {
+                // IOKit may provide the report ID separately from its payload.
+                let candidates = [frame.data, Data([BekenCodec.outputReportID8K]) + frame.data]
+                for candidate in candidates {
+                    if let packet = BekenCodec.response(from: candidate, reportID: reportID) { return packet }
+                }
+            }
+            if timeout <= 0 || !condition.wait(until: deadline) { return nil }
+        } while Date() < deadline
+        return nil
+    }
+
+    var summary: String {
+        condition.lock()
+        defer { condition.unlock() }
+        return "Interrupt Input 0x04: \(receivedCount) reports; last prefix: \(lastPreview)"
     }
 }

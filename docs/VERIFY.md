@@ -22,7 +22,7 @@
 
 ### Connection
 
-- [ ] Plug **8K 2.4G receiver** → app shows **2.4G 8K** and product string
+- [x] User log: v1.0.7 shared-opens **8K 2.4G receiver** (`1D57:FA65`, Output `0x04`/64); configuration readback is still unavailable
 - [ ] Unplug → Rescan shows No Device
 - [ ] Plug **USB-C wired** (if exposed as same VID/PID family) → connects
 - [ ] BT mode: pointer works, advanced config may be unavailable (expected)
@@ -73,3 +73,14 @@ Mock tests verify app behavior; they do not establish firmware support.
 - [ ] Apply during receiver reset; UI stays responsive and duplicate operations
       are disabled.
 - [ ] Power-cycle the mouse after a verified write to check persistence separately.
+
+
+## 8K receiver without Feature reports
+
+- [ ] On v1.0.8, Rescan and copy connection details. Inspect declared Input IDs,
+      raw report descriptor, actual GET_REPORT result and vendor interrupt count.
+- [ ] If no valid configuration response arrives, capture OEM Windows startup
+      and setting reads with the existing proxy. Preserve TX/RX and GetFeature
+      records; a successful WriteUSB return alone does not establish read support.
+- [ ] Verify an interrupt reply predates neither reconnect nor the latest write;
+      unrelated reports and invalid checksums must not count as readback.
