@@ -13,9 +13,11 @@ struct SC680ConfigApp: App {
         .commands {
             CommandGroup(replacing: .newItem) {}
             CommandMenu("Device") {
-                Button("Rescan") { store.refreshConnection() }
+                Button("Rescan") { Task { await store.refreshConnection() } }
+                    .disabled(store.isBusy)
                     .keyboardShortcut("r", modifiers: [.command])
-                Button("Apply All") { store.applyAll() }
+                Button("Apply All") { Task { await store.applyAll() } }
+                    .disabled(store.isBusy)
                     .keyboardShortcut(.return, modifiers: [.command])
             }
         }

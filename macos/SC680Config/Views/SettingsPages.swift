@@ -17,16 +17,22 @@ struct ButtonSettingsView: View {
                         Text("Back").tag(ButtonAction.backward)
                         Text("Double Click").tag(ButtonAction.doubleClick)
                         Text("Fire Button").tag(ButtonAction.fireButton)
-                        Text("Easy Aim").tag(ButtonAction.easyAim)
+                        Text("Easy Aim (unverified)").tag(ButtonAction.easyAim).disabled(true)
                         Text("DPI Cycle").tag(ButtonAction.dpiCycle)
                         Text("DPI +").tag(ButtonAction.dpiUp)
                         Text("DPI -").tag(ButtonAction.dpiDown)
                         Text("Scroll Up").tag(ButtonAction.scrollUp)
                         Text("Scroll Down").tag(ButtonAction.scrollDown)
+                        Text("Profile Cycle").tag(ButtonAction.profileCycle)
+                        if case .unknown(let code) = button.action {
+                            Text("Device action 0x\(String(code, radix: 16)) (preserved)").tag(button.action)
+                        }
                         Text("Off").tag(ButtonAction.off)
                     }
                 }
             }
+            Text("Middle is the wheel click. Unknown device actions are preserved unless you change them.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
     }
@@ -61,17 +67,9 @@ struct DPISettingsView: View {
             }
             Section {
                 Button("Apply DPI") {
-                    do {
-                        try store.sendUnlock()
-                        Thread.sleep(forTimeInterval: 0.2)
-                        try store.ensureOpen(forceReopen: false)
-                        try store.applyDPI()
-                        store.statusText = "DPI applied (stage \(store.activeDPIIndex + 1), \(store.dpiSlots[store.activeDPIIndex].dpi))"
-                    } catch {
-                        store.statusText = error.localizedDescription
-                    }
+                    Task { await store.applyOnly(.dpi) }
                 }
-                Text("No Mac reboot needed. After Apply: press the mouse DPI button to cycle stages, or power-cycle the mouse. Transport should show output8K+feature.")
+                Text("Apply checks the device response. If readback is unavailable or differs, the status shows that verification failed.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -94,12 +92,7 @@ struct LightSettingsView: View {
             LabeledContent("Speed") { Slider(value: $store.lightSpeed, in: 0...100) }
             ColorPicker("Color", selection: $store.lightColor)
             Button("Apply Light") {
-                do {
-                    try store.sendUnlock()
-                    try store.applyLight()
-                } catch {
-                    store.statusText = error.localizedDescription
-                }
+                Task { await store.applyOnly(.light) }
             }
             Text("Wheel LED effects are OEM-extended. If Apply does not change the mouse, use DPI tab colors (those are confirmed on SC680).")
                 .font(.caption)
@@ -121,8 +114,7 @@ struct PollingSettingsView: View {
             }
             .pickerStyle(.radioGroup)
             Button("Apply Polling Rate") {
-                do { try store.sendUnlock(); try store.applyPolling(); store.statusText = "Polling applied" }
-                catch { store.statusText = error.localizedDescription }
+                Task { await store.applyOnly(.polling) }
             }
         }
         .formStyle(.grouped)
@@ -138,16 +130,17 @@ struct PerformanceSettingsView: View {
                 Text("1 mm").tag(1)
                 Text("2 mm").tag(2)
             }
+            Text("LOD is saved locally; this firmware's LOD command is not implemented.")
+                .font(.caption).foregroundStyle(.secondary)
             LabeledContent("Key Response Time") {
-                Slider(value: $store.debounceMs, in: 2...25, step: 1)
+                Slider(value: $store.debounceMs, in: 2...40, step: 2)
                 Text("\(Int(store.debounceMs)) ms").frame(width: 50)
             }
             Toggle("Ripple Control", isOn: $store.rippleControl)
             Toggle("Angle Snapping", isOn: $store.angleSnap)
             Toggle("Motion Sync", isOn: $store.motionSync)
             Button("Apply Attributes") {
-                do { try store.sendUnlock(); try store.applyParams(); store.statusText = "Attributes applied" }
-                catch { store.statusText = error.localizedDescription }
+                Task { await store.applyOnly(.parameters) }
             }
         }
         .formStyle(.grouped)
@@ -165,7 +158,7 @@ struct PowerSettingsView: View {
             }
             Toggle("Move Wake", isOn: $store.moveWake)
             LabeledContent("Battery", value: store.batteryPercent.map { "\($0)%" } ?? "—")
-            Text("Sleep timer is stored in the active profile and sent with Apply.")
+            Text("Sleep Timer and Move Wake are saved locally. Device commands are not implemented.")
                 .foregroundStyle(.secondary)
         }
         .formStyle(.grouped)
@@ -177,7 +170,7 @@ struct MacroSettingsView: View {
 
     var body: some View {
         Form {
-            Section("Macros (local library; assign via Buttons when device supports onboard slots)") {
+            Section("Macros (local library only; device assignment and playback are not implemented)") {
                 if store.macros.isEmpty {
                     Text("No macros yet.")
                         .foregroundStyle(.secondary)

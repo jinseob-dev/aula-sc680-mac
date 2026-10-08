@@ -93,7 +93,7 @@ Checksum: sum of bytes `[3..56]` as u16 BE at `[57..58]`.
 - Native DPI packet already starts with `0x04` → send padded to 64 bytes.
 - Packets whose Beken report id ≠ `0x04` (rate/param/button): send as  
   **`[0x04] + full_beken_packet...` padded to 64**, **or** `SetFeature(beken_packet)` when the Feature collection accepts it (wired / some dongles).
-- macOS implementation tries **Feature report first**, then **Output report** fallback for 8K.
+- macOS opens Feature and Output collections on the same receiver. It unlocks via Feature `0x80`, sends 8K configuration through Output `0x04`/64, and validates the requested response before reporting verified success. Feature fallback is used if an Output write fails. The exact report descriptors and firmware behavior must still be checked on hardware.
 
 ## Capture tooling
 

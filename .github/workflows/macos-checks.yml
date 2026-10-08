@@ -1,0 +1,22 @@
+name: macOS checks
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+      - cursor/fix-dual-hid-unlock-32a4
+permissions:
+  contents: read
+jobs:
+  build-and-regressions:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build app
+        run: >-
+          xcodebuild -project macos/SC680Config.xcodeproj
+          -scheme SC680Config -configuration Release
+          -derivedDataPath /tmp/sc680-build
+          ARCHS=arm64 CODE_SIGNING_ALLOWED=NO build
+      - name: Run regression tests
+        run: bash macos/scripts/run-regression-tests.sh

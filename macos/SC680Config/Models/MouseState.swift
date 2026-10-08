@@ -75,6 +75,7 @@ enum ButtonAction: Equatable, Hashable {
     case shortcut(String)
     case macro(String)
     case off
+    case unknown(UInt8)
 }
 
 struct MacroDefinition: Identifiable, Equatable, Codable {
@@ -110,6 +111,56 @@ struct MouseProfile: Identifiable, Equatable, Codable {
     var rippleControl: Bool
     var angleSnap: Bool
     var motionSync: Bool
+
+    /// Reject malformed profiles before they reach UI bindings or HID encoders.
+    func validated() throws -> MouseProfile {
+        func require(_ condition: Bool, _ message: String) throws {
+            if !condition { throw ProfileValidationError.invalid(message) }
+        }
+        try require(dpiSlots.count == 8, "A profile must contain eight DPI stages")
+        try require(dpiSlots.indices.contains(activeDPIIndex), "Active DPI stage is out of range")
+        try require(dpiSlots.contains(where: \.enabled), "Enable at least one DPI stage")
+        try require(dpiSlots[activeDPIIndex].enabled, "The active DPI stage must be enabled")
+        for (index, slot) in dpiSlots.enumerated() {
+            try require(slot.id == index, "DPI stage IDs must be consecutive")
+            try require((50...26000).contains(slot.dpi) && slot.dpi % 50 == 0, "DPI must be 50–26000 in steps of 50")
+            try require([slot.red, slot.green, slot.blue].allSatisfy { $0.isFinite && (0...1).contains($0) }, "DPI colors must be between 0 and 1")
+        }
+        try require([125, 250, 500, 1000, 2000, 4000, 8000].contains(pollingRate), "Unsupported polling rate")
+        try require(buttons.count == 6 || buttons.count == 7, "A profile must contain six physical button bindings")
+        for (index, button) in buttons.enumerated() {
+            try require(button.id == index, "Button IDs must be consecutive")
+            if index < 6 {
+                switch button.action {
+                case .easyAim, .shortcut, .macro:
+                    throw ProfileValidationError.invalid("Easy Aim, shortcuts and macro assignments are not implemented")
+                default: break
+                }
+            }
+        }
+        try require(LightMode(rawValue: lightMode) != nil, "Unknown light mode")
+        try require([lightBrightness, lightSpeed].allSatisfy { $0.isFinite && (0...100).contains($0) }, "Light brightness and speed must be 0–100")
+        try require([lightRed, lightGreen, lightBlue].allSatisfy { $0.isFinite && (0...1).contains($0) }, "Light color must be between 0 and 1")
+        try require(sleepMinutes.isFinite && (1...20).contains(sleepMinutes), "Sleep timer must be 1–20 minutes")
+        try require(lodMM == 1 || lodMM == 2, "LOD must be 1 or 2 mm")
+        try require(debounceMs.isFinite && (2...40).contains(debounceMs) && debounceMs.truncatingRemainder(dividingBy: 2) == 0,
+                    "Debounce must be 2–40 ms in steps of 2")
+        var result = self
+        // Older exports included a duplicate Scroll binding for the Middle hardware slot.
+        result.buttons = Array(buttons.prefix(6))
+        return result
+    }
+}
+
+enum ProfileValidationError: LocalizedError {
+    case invalid(String)
+    var errorDescription: String? {
+        switch self { case .invalid(let message): return message }
+    }
+}
+
+enum SettingsSection: String {
+    case dpi = "DPI", polling = "Polling", parameters = "Attributes", buttons = "Buttons", light = "Light"
 }
 
 @MainActor
@@ -146,89 +197,49 @@ final class DeviceStore: ObservableObject {
     @Published var buttons: [ButtonBinding] = DeviceStore.defaultButtons()
     @Published var macros: [MacroDefinition] = []
 
-    private let transport = HIDTransport()
-    private let profilesURL: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("SC680Config", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("profiles.json")
-    }()
-    private let macrosURL: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-            .appendingPathComponent("SC680Config", isDirectory: true)
-        return dir.appendingPathComponent("macros.json")
-    }()
+    @Published private(set) var isBusy = false
+    private let session: DeviceSession
+    private var rawButtons: Data?
+    private let profilesURL: URL
+    private let macrosURL: URL
 
-    init() {
+    init(session: DeviceSession = HIDClient(), storageDirectory: URL? = nil) {
+        self.session = session
+        let directory = storageDirectory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("SC680Config", isDirectory: true)
+        profilesURL = directory.appendingPathComponent("profiles.json")
+        macrosURL = directory.appendingPathComponent("macros.json")
+        do { try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true) }
+        catch { statusText = "Local storage unavailable: \(error.localizedDescription)" }
         loadLocalState()
-        if profileDocs.isEmpty {
-            profileDocs = [snapshotProfile(name: "Profile 1")]
-        }
-        transport.onDeviceRemoved = { [weak self] in
+        if profileDocs.isEmpty { profileDocs = [snapshotProfile(name: "Profile 1")] }
+        session.onDeviceRemoved = { [weak self] in
             Task { @MainActor in
-                // Soft UI mark only — Apply retries reopen after USB resets.
                 guard let self else { return }
-                if self.connection != .none {
-                    self.statusText = "Receiver reset — reconnecting…"
-                }
+                self.rawButtons = nil
+                guard !self.isBusy else { return }
+                self.markDisconnected(reason: "Receiver disconnected — reconnect and tap Rescan")
             }
         }
     }
 
-    func refreshConnection() {
+    func refreshConnection() async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        statusText = "Connecting…"
         do {
-            let id = try ensureOpen(forceReopen: true)
-            productName = transport.productName
-            connection = (id == SC680DeviceIDs.dongle8K) ? .wireless8K : .wireless
-            lastTransport = transport.transportMode.rawValue
-            let paths = [
-                transport.hasOutputPath ? "Out" : nil,
-                transport.hasFeaturePath ? "Feat" : nil,
-            ].compactMap { $0 }.joined(separator: "+")
-            statusText = "Connected: \(productName) (\(id.label)) via \(lastTransport)"
-                + (paths.isEmpty ? "" : " [\(paths)]")
-            syncFromDevice()
-        } catch {
-            markDisconnected(reason: error.localizedDescription)
-        }
+            let info = try await session.open(forceReopen: true)
+            updateConnection(info)
+            rawButtons = nil
+            await syncFromDevice()
+        } catch { markDisconnected(reason: error.localizedDescription) }
     }
 
-    /// Keep / re-open the HID session.
-    @discardableResult
-    func ensureOpen(forceReopen: Bool = false) throws -> USBIdentity {
-        if transport.isOpen, !forceReopen, let id = transport.identity {
-            return id
-        }
-        // USB reset after unlock/write: wait briefly then reopen.
-        var lastError: Error = HIDTransportError.openFailed("unknown")
-        for attempt in 0..<4 {
-            if attempt > 0 {
-                Thread.sleep(forTimeInterval: 0.25 * Double(attempt))
-            }
-            do {
-                let id = try transport.openFirstMatching()
-                productName = transport.productName
-                connection = (id == SC680DeviceIDs.dongle8K) ? .wireless8K : .wireless
-                lastTransport = transport.transportMode.rawValue
-                return id
-            } catch {
-                lastError = error
-            }
-        }
-        throw lastError
-    }
-
-    /// Run a HID write, reopening once if the session dropped mid-transfer.
-    private func performTransfer(_ body: () throws -> Void) throws {
-        try ensureOpen()
-        do {
-            try body()
-        } catch {
-            // Dongle often re-enumerates after unlock / rate changes.
-            Thread.sleep(forTimeInterval: 0.35)
-            try ensureOpen(forceReopen: true)
-            try body()
-        }
+    private func updateConnection(_ info: HIDConnectionInfo) {
+        connection = info.identity == SC680DeviceIDs.dongle8K ? .wireless8K : .wireless
+        productName = info.productName
+        lastTransport = info.transportMode.rawValue
     }
 
     private func markDisconnected(reason: String) {
@@ -236,244 +247,173 @@ final class DeviceStore: ObservableObject {
         productName = ""
         batteryPercent = nil
         lastTransport = ""
+        rawButtons = nil
         statusText = reason
     }
 
-    func syncFromDevice() {
-        guard transport.isOpen else { return }
-        do {
-            // Battery
-            if let bat = try? transport.readBekenPacket(reportID: BekenCodec.batteryReportID, length: 7),
-               let pct = BekenCodec.decodeBattery(bat) {
-                batteryPercent = pct
+    func syncFromDevice() async {
+        var missing = [String]()
+        batteryPercent = nil
+        if let raw = try? await session.read(reportID: BekenCodec.batteryReportID, length: 7),
+           let pct = BekenCodec.decodeBattery(raw) { batteryPercent = pct }
+        else { missing.append("Battery") }
+
+        if let raw = try? await session.read(reportID: BekenCodec.dpiReportID, length: 52),
+           let decoded = BekenCodec.decodeDPI(raw) {
+            for i in dpiSlots.indices {
+                dpiSlots[i].dpi = decoded.slots[i]
+                dpiSlots[i].enabled = decoded.enabledMask & (1 << i) != 0
+                dpiSlots[i].red = Double(decoded.colors[i].0) / 255
+                dpiSlots[i].green = Double(decoded.colors[i].1) / 255
+                dpiSlots[i].blue = Double(decoded.colors[i].2) / 255
             }
-            // DPI
-            if let raw = try? transport.readBekenPacket(reportID: BekenCodec.dpiReportID, length: 52),
-               let decoded = BekenCodec.decodeDPI(raw) {
-                for i in 0..<min(dpiSlots.count, decoded.slots.count) where decoded.slots[i] > 0 {
-                    dpiSlots[i].dpi = decoded.slots[i]
-                    dpiSlots[i].enabled = true
-                }
-                activeDPIIndex = min(max(0, decoded.activeIndex), dpiSlots.count - 1)
+            activeDPIIndex = decoded.activeIndex
+        } else { missing.append("DPI") }
+
+        if let raw = try? await session.read(reportID: BekenCodec.rateReportID, length: 9),
+           let hz = BekenCodec.decodeRate(raw) { pollingRate = hz }
+        else { missing.append("Polling") }
+
+        if let raw = try? await session.read(reportID: BekenCodec.paramReportID, length: 13),
+           let decoded = BekenCodec.decodeParams(raw) {
+            debounceMs = Double(decoded.debounceMs)
+            angleSnap = decoded.angleSnap
+            rippleControl = decoded.ripple
+            motionSync = decoded.motionSync
+        } else { missing.append("Attributes") }
+
+        if let raw = try? await session.read(reportID: BekenCodec.buttonReportID, length: 64),
+           let actions = BekenCodec.decodeButtons(raw) {
+            rawButtons = raw
+            for (ui, hw) in BekenCodec.uiButtonSlots.enumerated() {
+                buttons[ui].action = BekenCodec.buttonAction(from: actions[hw])
             }
-            // Rate
-            if let raw = try? transport.readBekenPacket(reportID: BekenCodec.rateReportID, length: 9),
-               let hz = BekenCodec.decodeRate(raw) {
-                pollingRate = hz
-            }
-            // Params
-            if let raw = try? transport.readBekenPacket(reportID: BekenCodec.paramReportID, length: 13),
-               let p = BekenCodec.decodeParams(raw) {
-                debounceMs = Double(p.debounceMs)
-                angleSnap = p.angleSnap
-                rippleControl = p.ripple
-            }
-            // Buttons
-            if let raw = try? transport.readBekenPacket(reportID: BekenCodec.buttonReportID, length: 64),
-               let actions = BekenCodec.decodeButtons(raw) {
-                let map = [0, 1, 2, 4, 5, 3] // hw indices for first 6 UI buttons
-                for (ui, hw) in map.enumerated() where ui < buttons.count && hw < actions.count {
-                    buttons[ui].action = BekenCodec.buttonAction(from: actions[hw])
-                }
-            }
-            statusText = "Synced from device"
-        }
+        } else { missing.append("Buttons") }
+        statusText = missing.isEmpty ? "Synced from device" : "Connected; could not read: \(missing.joined(separator: ", ")). Existing values kept."
     }
 
-    func applyAll() {
+    func applyAll() async { await apply([.dpi, .polling, .parameters, .buttons, .light]) }
+    func applyOnly(_ section: SettingsSection) async { await apply([section]) }
+
+    private func apply(_ sections: [SettingsSection]) async {
+        guard !isBusy else { return }
+        isBusy = true
+        defer { isBusy = false }
+        statusText = "Applying…"
+        var written = [String]()
+        var notices = [String]()
         do {
-            try ensureOpen(forceReopen: true)
-            try sendUnlock()
-            // Unlock can reset the 8K radio — reopen before commits.
-            Thread.sleep(forTimeInterval: 0.4)
-            try ensureOpen(forceReopen: true)
-            try applyDPI()
-            try applyPolling()
-            try applyParams()
-            try applyButtons()
-            try applyLight()
+            // Validate before any HID writes or numeric conversions.
+            _ = try snapshotProfile(name: "Current").validated()
+            let info = try await session.open(forceReopen: false)
+            updateConnection(info)
+            if !(try await session.unlock()) {
+                notices.append("Feature unlock unavailable; receiver acceptance is unconfirmed")
+            }
+            for section in sections {
+                let warning: String?
+                switch section {
+                case .dpi: warning = try await applyDPI()
+                case .polling: warning = try await applyPolling()
+                case .parameters: warning = try await applyParams()
+                case .buttons: warning = try await applyButtons()
+                case .light: warning = try await applyLight()
+                }
+                written.append(section.rawValue)
+                if let warning { notices.append(warning) }
+            }
             persistActiveProfile()
-            statusText = "Applied configuration to device"
+            statusText = notices.isEmpty
+                ? "Applied and verified: \(written.joined(separator: ", "))"
+                : "\(written.joined(separator: ", ")) sent. \(notices.joined(separator: "; "))"
         } catch {
-            statusText = error.localizedDescription
-            if !transport.isOpen {
-                connection = .none
-            }
+            let prefix = written.isEmpty ? "Apply failed" : "Partial apply (\(written.joined(separator: ", ")) already sent)"
+            statusText = "\(prefix): \(error.localizedDescription)"
         }
     }
 
-    func applyDPI() throws {
-        try performTransfer {
-            let values = dpiSlots.map(\.dpi)
-            var mask: UInt8 = 0
-            for (i, slot) in dpiSlots.enumerated() where slot.enabled && i < 8 {
-                mask |= 1 << i
-            }
-            let colors: [(UInt8, UInt8, UInt8)] = dpiSlots.map {
-                (UInt8(clamping: Int($0.red * 255)), UInt8(clamping: Int($0.green * 255)), UInt8(clamping: Int($0.blue * 255)))
-            }
-            let enabled = mask == 0 ? UInt8(0x1F) : mask
-
-            // 8K confirmed path = WriteUSB 64-byte Output report 0x04 (see docs/fixtures/dpi_write_64.hex).
-            if transport.identity == SC680DeviceIDs.dongle8K || transport.transportMode == .output8K {
-                let out = BekenCodec.encodeDPIOutput64(
-                    slots: values,
-                    activeIndex: activeDPIIndex,
-                    colors: colors,
-                    enabledMask: enabled
-                )
-                try transport.send8KOutput(out)
-            } else {
-                let packet = BekenCodec.encodeDPI(
-                    slots: values,
-                    activeIndex: activeDPIIndex,
-                    colors: colors,
-                    enabledMask: enabled
-                )
-                try transport.sendBekenPacket(packet)
-            }
-            Thread.sleep(forTimeInterval: 0.08)
-            try sendApplyCommit()
-
-            // Verify: read DPI back when Feature path exists.
-            if transport.hasFeaturePath,
-               let raw = try? transport.readBekenPacket(reportID: BekenCodec.dpiReportID, length: 52),
-               let decoded = BekenCodec.decodeDPI(raw) {
-                let expected = values[min(activeDPIIndex, values.count - 1)]
-                let got = decoded.slots.indices.contains(decoded.activeIndex)
-                    ? decoded.slots[decoded.activeIndex] : -1
-                if got > 0, abs(got - expected) > 50 {
-                    statusText = "DPI write sent but device reports \(got) (wanted \(expected)) — press mouse DPI button / power-cycle mouse"
-                }
-            }
+    private func applyDPI() async throws -> String? {
+        let values = dpiSlots.map(\.dpi)
+        let colors = dpiSlots.map { (UInt8(($0.red * 255).rounded()), UInt8(($0.green * 255).rounded()), UInt8(($0.blue * 255).rounded())) }
+        let mask = dpiSlots.enumerated().reduce(UInt8(0)) { $1.element.enabled ? $0 | (1 << $1.offset) : $0 }
+        let packet = BekenCodec.encodeDPI(slots: values, activeIndex: activeDPIIndex, colors: colors, enabledMask: mask)
+        try await session.send(packet, outputOnly: false)
+        let commitNotice = await sendApplyCommit()
+        guard let raw = try? await session.read(reportID: BekenCodec.dpiReportID, length: 52),
+              let decoded = BekenCodec.decodeDPI(raw) else { return "DPI readback unavailable; application unverified" }
+        let colorMatch = zip(colors, decoded.colors).allSatisfy { pair in
+            let (expected, got) = pair
+            return expected.0 == got.0 && expected.1 == got.1 && expected.2 == got.2
         }
+        guard decoded.slots == values, decoded.activeIndex == activeDPIIndex,
+              decoded.enabledMask == mask, colorMatch else { return "DPI readback differs from the requested stages, mask, active stage or colors" }
+        return commitNotice
     }
 
-    /// OEM commit after config writes. Best-effort — some firmwares ignore 0x0C.
-    func sendApplyCommit() throws {
-        let packet = BekenCodec.encodeApplyCommit()
+    private func sendApplyCommit() async -> String? {
         do {
-            if transport.identity == SC680DeviceIDs.dongle8K || transport.transportMode == .output8K {
-                try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
-            } else {
-                try transport.sendBekenPacket(packet)
-            }
-        } catch {
-            // Non-fatal: DPI/rate frames are accepted without an explicit apply on many builds.
-            NSLog("SC680Config apply commit skipped: %@", String(describing: error))
-        }
-        Thread.sleep(forTimeInterval: 0.05)
+            try await session.send(BekenCodec.encodeApplyCommit(), outputOnly: false)
+            return nil
+        } catch { return "Commit failed; persistence after power-cycle is unverified" }
     }
 
-    func applyPolling() throws {
-        try performTransfer {
-            let packet = BekenCodec.encodeRate(hz: pollingRate)
-            try transport.sendBekenPacket(packet)
-            Thread.sleep(forTimeInterval: 0.08)
-        }
+    private func applyPolling() async throws -> String? {
+        let expected = pollingRate
+        try await session.send(BekenCodec.encodeRate(hz: expected), outputOnly: false)
+        guard let raw = try? await session.read(reportID: BekenCodec.rateReportID, length: 9),
+              let got = BekenCodec.decodeRate(raw) else { return "Polling readback unavailable; application unverified" }
+        return got == expected ? nil : "Polling readback is \(got) Hz (requested \(expected) Hz)"
     }
 
-    func applyParams() throws {
-        try performTransfer {
-            let packet = BekenCodec.encodeParams(
-                debounceMs: Int(debounceMs),
-                angleSnap: angleSnap,
-                ripple: rippleControl,
-                motionSync: motionSync
-            )
-            try transport.sendBekenPacket(packet)
-            Thread.sleep(forTimeInterval: 0.08)
-        }
+    private func applyParams() async throws -> String? {
+        let packet = BekenCodec.encodeParams(debounceMs: Int(debounceMs), angleSnap: angleSnap,
+                                             ripple: rippleControl, motionSync: motionSync)
+        try await session.send(packet, outputOnly: false)
+        guard let raw = try? await session.read(reportID: BekenCodec.paramReportID, length: 13),
+              let got = BekenCodec.decodeParams(raw) else { return "Attributes readback unavailable; application unverified" }
+        return got.debounceMs == Int(debounceMs) && got.angleSnap == angleSnap && got.ripple == rippleControl && got.motionSync == motionSync
+            ? nil : "Attributes readback differs from the requested values"
     }
 
-    func applyButtons() throws {
-        try performTransfer {
-            // Hardware order: Left, Right, Middle, DPI, Back, Forward, ...
-            var actions = [UInt8](repeating: 0x01, count: 18)
-            let uiToHw = [0, 1, 2, 5, 4, 3, 2] // map 7 UI buttons → hw slots
-            for (ui, hw) in uiToHw.enumerated() where ui < buttons.count {
-                actions[hw] = BekenCodec.actionCode(for: buttons[ui].action)
-            }
-            actions[16] = BekenCodec.actionCode(for: .scrollUp)
-            actions[17] = BekenCodec.actionCode(for: .scrollDown)
-            let packet = BekenCodec.encodeButtons(actions)
-            try transport.sendBekenPacket(packet)
-            Thread.sleep(forTimeInterval: 0.08)
+    private func applyButtons() async throws -> String? {
+        // Read before editing so unknown actions, parameters and unmapped slots survive Apply.
+        if let raw = try? await session.read(reportID: BekenCodec.buttonReportID, length: 64),
+           BekenCodec.decodeButtons(raw) != nil { rawButtons = raw }
+        guard let original = rawButtons, var actions = BekenCodec.decodeButtons(original) else {
+            throw HIDTransportError.reportFailed("cannot read button configuration; refusing to overwrite unknown slots")
         }
+        for (ui, hw) in BekenCodec.uiButtonSlots.enumerated() {
+            actions[hw] = BekenCodec.actionCode(for: buttons[ui].action)
+        }
+        let packet = BekenCodec.encodeButtons(actions, preserving: original)
+        try await session.send(packet, outputOnly: false)
+        guard let raw = try? await session.read(reportID: BekenCodec.buttonReportID, length: 64),
+              BekenCodec.decodeButtons(raw) != nil else { return "Buttons readback unavailable; application unverified" }
+        rawButtons = raw
+        return Data(raw[3...56]) == Data(packet[3...56]) ? nil : "Buttons readback differs from the requested mapping"
     }
 
-    func applyLight() throws {
-        // Persist locally even if the dongle rejects the OEM light frame.
-        persistActiveProfile()
-
-        var red: UInt8 = 255, green: UInt8 = 0, blue: UInt8 = 0
-        let ns = NSColor(lightColor)
-        if let rgb = ns.usingColorSpace(.deviceRGB) {
-            red = UInt8(clamping: Int(rgb.redComponent * 255))
-            green = UInt8(clamping: Int(rgb.greenComponent * 255))
-            blue = UInt8(clamping: Int(rgb.blueComponent * 255))
-        }
-        let brightness = UInt8(clamping: Int(lightBrightness))
-        let speed = UInt8(clamping: Int(lightSpeed))
-        let frames = BekenCodec.encodeLightFrames(
-            mode: lightMode.oemCode,
-            brightness: brightness,
-            speed: speed,
-            red: red,
-            green: green,
-            blue: blue
-        )
-
-        var lastError: Error?
-        try ensureOpen()
+    private func applyLight() async throws -> String? {
+        let rgb = NSColor(lightColor).usingColorSpace(.deviceRGB)
+        let frames = BekenCodec.encodeLightFrames(mode: lightMode.oemCode,
+            brightness: UInt8(lightBrightness), speed: UInt8(lightSpeed),
+            red: UInt8(clamping: Int(((rgb?.redComponent ?? 1) * 255).rounded())),
+            green: UInt8(clamping: Int(((rgb?.greenComponent ?? 0) * 255).rounded())),
+            blue: UInt8(clamping: Int(((rgb?.blueComponent ?? 0) * 255).rounded())))
+        var lastError: Error = HIDTransportError.reportFailed("light unsupported")
         for frame in frames {
             do {
-                if frame.first == BekenCodec.dpiReportID, frame.count == BekenCodec.outputLength8K {
-                    try transport.send8KOutput(frame)
-                } else {
-                    try transport.sendBekenPacket(frame)
-                }
-                Thread.sleep(forTimeInterval: 0.08)
-                statusText = "Light applied (\(lightMode.rawValue))"
-                return
-            } catch {
-                lastError = error
-                // USB blip — reopen once and try next frame shape.
-                Thread.sleep(forTimeInterval: 0.2)
-                _ = try? ensureOpen(forceReopen: true)
-            }
+                try await session.send(frame, outputOnly: frame.first == BekenCodec.dpiReportID && frame.count == 64)
+                return "Light command sent; firmware effect cannot be verified"
+            } catch { lastError = error }
         }
-
-        // Do not surface setFeature 0xE0005000 for unsupported legacy light reports.
-        statusText = "Light saved in profile — effect may be unsupported on this 8K firmware"
-        if let lastError {
-            // Keep detail available for debugging without looking like a hard failure.
-            NSLog("SC680Config applyLight: %@", String(describing: lastError))
-        }
-    }
-
-    func sendUnlock() throws {
-        try ensureOpen()
-        // Windows: SetFeature unlock on Feature device, then WriteUSB config on Report device.
-        // Without Feature unlock, Output writes can "succeed" but the mouse ignores them.
-        if transport.hasFeaturePath {
-            try transport.sendFeatureUnlock()
-            return
-        }
-        // Fallback: wrapped Output unlock (may be ignored by firmware).
-        for packet in BekenCodec.unlockPackets() {
-            do {
-                try transport.send8KOutput(BekenCodec.wrapFor8KOutput(packet))
-            } catch {
-                NSLog("SC680Config unlock soft-fail: %@", String(describing: error))
-            }
-            Thread.sleep(forTimeInterval: 0.08)
-        }
+        return "Light saved locally; device rejected the command (\(lastError.localizedDescription))"
     }
 
     // MARK: - Profiles / macros (local + device commit)
 
     func addProfile() {
+        persistActiveProfile()
         let name = "Profile \(profileDocs.count + 1)"
         profileDocs.append(snapshotProfile(name: name))
         activeProfileIndex = profileDocs.count - 1
@@ -509,11 +449,17 @@ final class DeviceStore: ObservableObject {
         rippleControl = false
         motionSync = false
         sleepMinutes = 3
+        moveWake = true
+        lodMM = 1
+        lightBrightness = 50
+        lightSpeed = 50
+        lightColor = .red
         persistActiveProfile()
         statusText = "Profile reset to defaults"
     }
 
     func exportActiveProfile(to url: URL) throws {
+        _ = try snapshotProfile(name: "Current").validated()
         persistActiveProfile()
         let data = try JSONEncoder().encode(profileDocs[activeProfileIndex])
         try data.write(to: url)
@@ -521,7 +467,10 @@ final class DeviceStore: ObservableObject {
 
     func importProfile(from url: URL) throws {
         let data = try Data(contentsOf: url)
-        let profile = try JSONDecoder().decode(MouseProfile.self, from: data)
+        var profile = try JSONDecoder().decode(MouseProfile.self, from: data).validated()
+        // Importing the same file twice must not create duplicate Identifiable IDs.
+        profile.id = UUID()
+        persistActiveProfile()
         profileDocs.append(profile)
         activeProfileIndex = profileDocs.count - 1
         loadProfile(at: activeProfileIndex)
@@ -595,22 +544,21 @@ final class DeviceStore: ObservableObject {
 
     private func saveLocalState() {
         if let data = try? JSONEncoder().encode(profileDocs) {
-            try? data.write(to: profilesURL)
+            try? data.write(to: profilesURL, options: .atomic)
         }
         if let data = try? JSONEncoder().encode(macros) {
-            try? data.write(to: macrosURL)
+            try? data.write(to: macrosURL, options: .atomic)
         }
     }
 
     private func loadLocalState() {
         if let data = try? Data(contentsOf: profilesURL),
            let docs = try? JSONDecoder().decode([MouseProfile].self, from: data) {
-            profileDocs = docs
-            if let first = docs.first {
-                profileDocs = docs
+            profileDocs = docs.compactMap { try? $0.validated() }
+            if !profileDocs.isEmpty {
                 loadProfile(at: 0)
-                _ = first
             }
+            if profileDocs.count != docs.count { statusText = "Invalid saved profiles were skipped; original file kept until the next save" }
         }
         if let data = try? Data(contentsOf: macrosURL),
            let docs = try? JSONDecoder().decode([MacroDefinition].self, from: data) {
@@ -639,7 +587,6 @@ final class DeviceStore: ObservableObject {
             .init(id: 3, name: "Forward", action: .forward),
             .init(id: 4, name: "Back", action: .backward),
             .init(id: 5, name: "DPI", action: .dpiCycle),
-            .init(id: 6, name: "Scroll", action: .middleClick),
         ]
     }
 }

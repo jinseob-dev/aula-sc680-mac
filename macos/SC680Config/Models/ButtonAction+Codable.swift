@@ -23,7 +23,10 @@ extension ButtonAction: Codable {
         case "profileCycle": self = .profileCycle
         case "shortcut": self = .shortcut(try c.decodeIfPresent(String.self, forKey: .value) ?? "")
         case "macro": self = .macro(try c.decodeIfPresent(String.self, forKey: .value) ?? "")
-        default: self = .off
+        case "unknown": self = .unknown(try c.decode(UInt8.self, forKey: .value))
+        case "off": self = .off
+        default:
+            throw DecodingError.dataCorruptedError(forKey: .type, in: c, debugDescription: "Unknown button action type")
         }
     }
 
@@ -51,6 +54,9 @@ extension ButtonAction: Codable {
             try c.encode("macro", forKey: .type)
             try c.encode(v, forKey: .value)
         case .off: try c.encode("off", forKey: .type)
+        case .unknown(let code):
+            try c.encode("unknown", forKey: .type)
+            try c.encode(code, forKey: .value)
         }
     }
 }

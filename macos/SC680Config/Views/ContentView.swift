@@ -23,7 +23,8 @@ struct ContentView: View {
                     Text(store.lastTransport.isEmpty ? "—" : "Transport: \(store.lastTransport)")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Button("Rescan") { store.refreshConnection() }
+                    Button("Rescan") { Task { await store.refreshConnection() } }
+                        .disabled(store.isBusy)
                         .buttonStyle(.borderedProminent)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -45,6 +46,7 @@ struct ContentView: View {
                     case .profiles: ProfileSettingsView()
                     }
                 }
+                .disabled(store.isBusy)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                 .padding()
             }
@@ -52,7 +54,7 @@ struct ContentView: View {
         .task {
             // One-shot connect on first appear; avoid re-opening on every view refresh.
             if store.connection == .none {
-                store.refreshConnection()
+                await store.refreshConnection()
             }
         }
     }
@@ -65,10 +67,11 @@ struct ContentView: View {
                 Text(store.statusText)
                     .font(.callout)
                     .foregroundStyle(.secondary)
-                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
-            Button("Apply") { store.applyAll() }
+            Button(store.isBusy ? "Working…" : "Apply") { Task { await store.applyAll() } }
+                .disabled(store.isBusy)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut(.return, modifiers: [.command])
