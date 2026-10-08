@@ -20,6 +20,9 @@ struct ContentView: View {
                         ProgressView(value: Double(battery), total: 100) {
                             Text(store.isCharging ? "Charging \(battery)%" : "Battery \(battery)%")
                         }
+                    } else if store.isCharging {
+                        Text("Charging — percentage unavailable")
+                            .font(.caption)
                     }
                     Text(store.lastTransport.isEmpty ? "—" : "Transport: \(store.lastTransport)")
                         .font(.caption)
@@ -28,10 +31,13 @@ struct ContentView: View {
                         .disabled(store.isBusy)
                         .buttonStyle(.borderedProminent)
                     Button("Copy Connection Details") {
-                        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
-                        let details = "SC680Config \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\nStatus: \(store.statusText)\n\(store.connectionDetails)"
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(details, forType: .string)
+                        Task {
+                            await store.captureConnectionDetails()
+                            let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+                            let details = "SC680Config \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\nStatus: \(store.statusText)\n\(store.connectionDetails)"
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(details, forType: .string)
+                        }
                     }
                     .disabled(store.isBusy)
                     .font(.caption)

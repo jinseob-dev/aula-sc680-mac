@@ -101,3 +101,19 @@ Existing Feature/GET_REPORT/validated interrupt read paths remain diagnostic
 fallbacks. No guessed output read commands are sent. Readback and persistence
 remain unverified on the physical device. Capture OEM startup, one DPI change,
 Apply, and its replies with USBPcap/Wireshark to resolve remaining sequence gaps.
+
+## First confirmed OEM telemetry (v1.0.9 hardware log)
+
+`03 10 40 01 63` arrived via Input 3. The event code is 4010, normal connection
+state 01, and battery byte 63 (99%). v1.0.10 exposes this independently of full
+settings reads. Four-byte callback payloads without the physical report ID are
+also accepted. Percentages must match the OEM's range 1..100. State 02 is charging
+and does not provide a measured percentage; it clears the cached percentage.
+Unknown events never replace valid power information. New HID sessions have a
+new telemetry inbox; disconnected devices expose no cached power snapshot.
+
+Apply All skips unconfirmed Attributes/Light and skips Buttons when existing
+mapping cannot be read, preserving DPI/Polling readback warnings. Locally invalid
+8K packets fail before retry/reopen, so their rejection cannot erase diagnostic
+input events. Diagnostics include bounded Output API return codes and prefixes;
+successful output calls still do not establish physical command acceptance.
