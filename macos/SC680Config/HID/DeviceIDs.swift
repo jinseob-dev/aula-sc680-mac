@@ -62,6 +62,27 @@ struct HIDInterfaceInfo {
 }
 
 
+/// OEM Input 0x03 power event, independent of configuration readback.
+struct ReceiverPowerState: Equatable {
+    let batteryPercent: Int?
+    let isCharging: Bool
+
+    static func decode(reportID: Int, data: Data) -> ReceiverPowerState? {
+        guard reportID == 3 else { return nil }
+        var bytes = Array(data)
+        if bytes.count == 5 {
+            guard bytes.first == 3 else { return nil }
+            bytes.removeFirst()
+        }
+        guard bytes.count == 4, bytes[0] == 0x10, bytes[1] == 0x40 else { return nil }
+        // Mouse.exe 0x413B89: low byte is connection/charging state,
+        // high byte is percentage. State 2 means charging, not a measured 100%.
+        if bytes[2] == 2 { return ReceiverPowerState(batteryPercent: nil, isCharging: true) }
+        guard bytes[2] == 1, (1...100).contains(Int(bytes[3])) else { return nil }
+        return ReceiverPowerState(batteryPercent: Int(bytes[3]), isCharging: false)
+    }
+}
+
 /// Bounded, thread-safe inbox for vendor Input 0x04 responses. Pointer/keyboard
 /// reports are never retained. A write/open timestamp prevents stale verification.
 final class HIDResponseInbox {
@@ -71,6 +92,7 @@ final class HIDResponseInbox {
     private var lastPreview = "none"
     private var telemetryCount = 0
     private var telemetryPreview = "none"
+    private var power: ReceiverPowerState?
 
     func record(reportID: Int, data: Data, receivedAt: TimeInterval = ProcessInfo.processInfo.systemUptime) {
         guard [3, Int(BekenCodec.outputReportID8K)].contains(reportID), !data.isEmpty, data.count <= 64 else { return }
@@ -78,6 +100,7 @@ final class HIDResponseInbox {
         defer { condition.unlock() }
         if reportID == 3 {
             // OEM monitor consumes this short event report, not a settings dump.
+            if let state = ReceiverPowerState.decode(reportID: reportID, data: data) { power = state }
             telemetryCount += 1
             telemetryPreview = data.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " ")
             return
@@ -104,6 +127,12 @@ final class HIDResponseInbox {
             if timeout <= 0 || !condition.wait(until: deadline) { return nil }
         } while Date() < deadline
         return nil
+    }
+
+    var receiverPower: ReceiverPowerState? {
+        condition.lock()
+        defer { condition.unlock() }
+        return power
     }
 
     var summary: String {

@@ -201,6 +201,7 @@ final class DeviceStore: ObservableObject {
     @Published private(set) var isBusy = false
     private let session: DeviceSession
     private var rawButtons: Data?
+    private var syncMissing: [String]?
     private let profilesURL: URL
     private let macrosURL: URL
 
@@ -228,6 +229,7 @@ final class DeviceStore: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         defer { isBusy = false }
+        syncMissing = nil
         statusText = "Connecting…"
         connectionDetails = ""
         do {
@@ -239,11 +241,25 @@ final class DeviceStore: ObservableObject {
         await captureConnectionDetails()
     }
 
-    private func captureConnectionDetails() async {
+    func captureConnectionDetails() async {
+        await updateReceiverPower()
         let details = await session.diagnostics()
         if !details.isEmpty {
             connectionDetails = "Transport: \(lastTransport)\n" + details
         }
+    }
+
+    private func updateReceiverPower() async {
+        guard connection != .none, let power = await session.receiverPower(), connection != .none else { return }
+        batteryPercent = power.batteryPercent
+        isCharging = power.isCharging
+        updateSyncStatus()
+    }
+
+    private func updateSyncStatus() {
+        guard var missing = syncMissing else { return }
+        if batteryPercent != nil || isCharging { missing.removeAll { $0 == "Battery" } }
+        statusText = missing.isEmpty ? "Synced from device" : "Connected; could not read: \(missing.joined(separator: ", ")). Existing values kept."
     }
 
     private func updateConnection(_ info: HIDConnectionInfo) {
@@ -254,9 +270,11 @@ final class DeviceStore: ObservableObject {
     }
 
     private func markDisconnected(reason: String) {
+        syncMissing = nil
         connection = .none
         productName = ""
         batteryPercent = nil
+        isCharging = false
         lastTransport = ""
         rawButtons = nil
         connectionDetails = reason + "\n" + connectionDetails
@@ -264,8 +282,10 @@ final class DeviceStore: ObservableObject {
     }
 
     func syncFromDevice() async {
+        syncMissing = nil
         var missing = [String]()
         batteryPercent = nil
+        isCharging = false
         if let raw = try? await session.read(reportID: BekenCodec.batteryReportID, length: 7),
            let pct = BekenCodec.decodeBattery(raw) { batteryPercent = pct }
         else { missing.append("Battery") }
@@ -301,7 +321,9 @@ final class DeviceStore: ObservableObject {
                 buttons[ui].action = BekenCodec.buttonAction(from: actions[hw])
             }
         } else { missing.append("Buttons") }
-        statusText = missing.isEmpty ? "Synced from device" : "Connected; could not read: \(missing.joined(separator: ", ")). Existing values kept."
+        await updateReceiverPower()
+        syncMissing = missing
+        updateSyncStatus()
     }
 
     func applyAll() async { await apply([.dpi, .polling, .parameters, .buttons, .light]) }
@@ -311,6 +333,7 @@ final class DeviceStore: ObservableObject {
         guard !isBusy else { return }
         isBusy = true
         defer { isBusy = false }
+        syncMissing = nil
         statusText = "Applying…"
         var written = [String]()
         var notices = [String]()
@@ -323,6 +346,19 @@ final class DeviceStore: ObservableObject {
                 notices.append("Receiver acceptance requires readback or a hardware check")
             }
             for section in sections {
+                if info.identity == SC680DeviceIDs.dongle8K && (section == .parameters || section == .light) {
+                    notices.append("\(section.rawValue) skipped: device application is not supported on this 8K receiver yet")
+                    continue
+                }
+                if sections.count > 1, section == .buttons, rawButtons == nil {
+                    // An unavailable button read must not undo or obscure other sections.
+                    if let raw = try? await session.read(reportID: BekenCodec.buttonReportID, length: 64),
+                       BekenCodec.decodeButtons(raw) != nil { rawButtons = raw }
+                    if rawButtons == nil {
+                        notices.append("Buttons skipped: existing mapping could not be read")
+                        continue
+                    }
+                }
                 let warning: String?
                 switch section {
                 case .dpi: warning = try await applyDPI()
@@ -335,7 +371,9 @@ final class DeviceStore: ObservableObject {
                 if let warning { notices.append(warning) }
             }
             persistActiveProfile()
-            statusText = notices.isEmpty
+            statusText = written.isEmpty
+                ? notices.joined(separator: "; ")
+                : notices.isEmpty
                 ? "Applied and verified: \(written.joined(separator: ", "))"
                 : "\(written.joined(separator: ", ")) sent. \(notices.joined(separator: "; "))"
         } catch {

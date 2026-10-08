@@ -17,10 +17,12 @@ protocol DeviceSession: AnyObject {
     func send(_ packet: Data, outputOnly: Bool) async throws
     func read(reportID: UInt8, length: Int) async throws -> Data
     func diagnostics() async -> String
+    func receiverPower() async -> ReceiverPowerState?
 }
 
 extension DeviceSession {
     func diagnostics() async -> String { "" }
+    func receiverPower() async -> ReceiverPowerState? { nil }
 }
 
 /// All HID calls and retry delays run on one worker queue, including removal handling.
@@ -93,6 +95,14 @@ final class HIDClient: DeviceSession {
         try await perform {
             let wasOpen = self.transport.isOpen
             try self.ensureOpen()
+            // Local packet validation must not trigger a reconnect/retry.
+            if outputOnly {
+                guard BekenCodec.is8KOutputEnvelope(packet) else {
+                    throw HIDTransportError.reportFailed("invalid 8K output envelope")
+                }
+            } else if self.transport.uses8KConfiguration {
+                _ = try BekenCodec.encode8KConfiguration(packet)
+            }
             if !wasOpen { _ = try self.unlockOnQueue() }
             let write = {
                 if outputOnly { try self.transport.send8KOutput(packet) }
@@ -112,6 +122,10 @@ final class HIDClient: DeviceSession {
 
     func diagnostics() async -> String {
         (try? await perform { self.transport.diagnostics }) ?? ""
+    }
+
+    func receiverPower() async -> ReceiverPowerState? {
+        (try? await perform { self.transport.receiverPower }) ?? nil
     }
 
     func read(reportID: UInt8, length: Int) async throws -> Data {
@@ -176,9 +190,19 @@ final class HIDTransport {
     private var selectedOutputInfo: HIDInterfaceInfo?
     private var minimumResponseTime = ProcessInfo.processInfo.systemUptime
     private var readTrace: [String] = []
+    private var outputTrace: [String] = []
 
     var diagnostics: String {
-        connectionDiagnostics + "\n" + responseInbox.summary + "\n" + readTrace.joined(separator: "\n")
+        connectionDiagnostics + "\n" + responseInbox.summary + "\n" + outputTrace.joined(separator: "\n") + "\n" + readTrace.joined(separator: "\n")
+    }
+
+    var uses8KConfiguration: Bool {
+        identity == SC680DeviceIDs.dongle8K || transportMode == .output8K || transportMode == .dual8K
+    }
+
+    var receiverPower: ReceiverPowerState? {
+        guard isOpen, identity == SC680DeviceIDs.dongle8K else { return nil }
+        return responseInbox.receiverPower
     }
 
     private func onMain(_ work: () -> Void) {
@@ -248,6 +272,7 @@ final class HIDTransport {
         connectionDiagnostics = ""
         responseInbox = HIDResponseInbox()
         readTrace = []
+        outputTrace = []
         selectedOutputInfo = nil
         minimumResponseTime = ProcessInfo.processInfo.systemUptime
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
@@ -445,7 +470,7 @@ final class HIDTransport {
             throw HIDTransportError.reportFailed("empty packet")
         }
 
-        let is8K = identity == SC680DeviceIDs.dongle8K || transportMode == .output8K || transportMode == .dual8K
+        let is8K = uses8KConfiguration
 
         if is8K {
             // Config writes: Output 0x04 / 64 (WriteUSB). Unlock uses sendFeatureUnlock separately.
@@ -491,6 +516,9 @@ final class HIDTransport {
                 buf.count
             )
         }
+        let prefix = bytes.prefix(12).map { String(format: "%02X", $0) }.joined(separator: " ")
+        outputTrace.append(String(format: "Output 0x04: setReport=0x%08X; prefix: %@", kr, prefix))
+        if outputTrace.count > 8 { outputTrace.removeFirst(outputTrace.count - 8) }
         guard kr == kIOReturnSuccess else {
             throw HIDTransportError.reportFailed(String(format: "setOutput 0x%08X", kr))
         }

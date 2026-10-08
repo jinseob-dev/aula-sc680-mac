@@ -10,6 +10,8 @@ final class MockSession: DeviceSession {
     var failLight = false
     var openDelay: UInt64 = 0
     var diagnosticText = ""
+    var powerState: ReceiverPowerState?
+    func receiverPower() async -> ReceiverPowerState? { powerState }
     func diagnostics() async -> String { diagnosticText }
 
     func open(forceReopen: Bool) async throws -> HIDConnectionInfo {
@@ -151,6 +153,51 @@ struct RegressionTests {
         try check(inbox.summary.contains("OEM Input 0x03: 1 events"), "Observe OEM telemetry reports")
         try check(inbox.response(reportID: 4, receivedAfter: 399, timeout: 0) == nil,
                   "Telemetry is not a complete DPI configuration or readback")
+
+        // Real v1.0.9 receiver log: 03 10 40 01 63 => battery 99%.
+        let powerInbox = HIDResponseInbox()
+        powerInbox.record(reportID: 3, data: Data([3, 0x10, 0x40, 1, 0x63]))
+        try check(powerInbox.receiverPower == ReceiverPowerState(batteryPercent: 99, isCharging: false),
+                  "Decode the actual receiver power event")
+        try check(ReceiverPowerState.decode(reportID: 3, data: Data([0x10, 0x40, 1, 0x63])) == powerInbox.receiverPower,
+                  "Handle payloads with the physical ID supplied separately")
+        for (id, invalid) in [(4, [UInt8(3), 0x10, 0x40, 1, 99]),
+                              (3, [3, 0x10, 0x20, 1, 99]), (3, [3, 0x10, 0x40, 1, 101]),
+                              (3, [3, 0x10, 0x40, 1]), (3, [3, 0x10, 0x40, 0, 99])] {
+            try check(ReceiverPowerState.decode(reportID: id, data: Data(invalid)) == nil,
+                      "Reject unrelated, malformed or invalid battery events")
+        }
+        powerInbox.record(reportID: 3, data: Data([3, 0x10, 0x10, 2, 0]))
+        try check(powerInbox.receiverPower?.batteryPercent == 99, "Stage events must not replace power state")
+        try check(powerInbox.response(reportID: 1, receivedAfter: 0, timeout: 0) == nil,
+                  "Power telemetry is not a fabricated configuration response")
+        powerInbox.record(reportID: 3, data: Data([3, 0x10, 0x40, 2, 99]))
+        try check(powerInbox.receiverPower == ReceiverPowerState(batteryPercent: nil, isCharging: true),
+                  "Charging must not imply a measured 100 percent")
+        try check(HIDResponseInbox().receiverPower == nil, "New connection has no stale power state")
+        let telemetrySession = MockSession()
+        telemetrySession.powerState = ReceiverPowerState(batteryPercent: 99, isCharging: false)
+        let telemetryStore = makeStore(telemetrySession)
+        await telemetryStore.refreshConnection()
+        try check(telemetryStore.batteryPercent == 99 && !telemetryStore.isCharging,
+                  "Show the real power event even when Feature battery read fails")
+        try check(!telemetryStore.statusText.contains("Battery") && telemetryStore.statusText.contains("DPI"),
+                  "Only battery is resolved; full settings remain unread")
+        telemetrySession.echoWrites = false
+        await telemetryStore.applyAll()
+        try check(telemetrySession.writes.map { $0[0] } == [4, 6],
+                  "Apply All sends supported sections and preserves unread buttons")
+        try check(telemetryStore.statusText.contains("Attributes skipped") && telemetryStore.statusText.contains("Light skipped") &&
+                  telemetryStore.statusText.contains("Buttons skipped") && telemetryStore.statusText.contains("readback unavailable"),
+                  "Preserve readback warnings and explicitly list skipped sections")
+        telemetrySession.writes.removeAll()
+        await telemetryStore.applyOnly(.parameters)
+        try check(telemetrySession.writes.isEmpty && telemetryStore.statusText.contains("Attributes skipped"),
+                  "Unsupported single-section apply must not claim a write")
+        telemetrySession.powerState = nil
+        await telemetryStore.refreshConnection()
+        try check(telemetryStore.batteryPercent == nil && !telemetryStore.isCharging,
+                  "Reconnecting without telemetry clears the previous battery")
 
         let minimum = BekenCodec.encodeDPI(slots: [50], activeIndex: 0, colors: [], enabledMask: 1)
         try check(BekenCodec.decodeDPI(minimum)?.slots[0] == 50, "50 DPI must survive readback")
