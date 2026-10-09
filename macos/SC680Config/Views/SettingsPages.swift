@@ -66,7 +66,7 @@ struct DPISettingsView: View {
                 }
             }
             Section {
-                Text("Use Apply DPI above to send these stages. The status indicates whether the device settings could be verified.")
+                Text("Use Apply DPI above to send these stages. Choose DPI Steady or DPI Breathe in Light to follow stage colors; Steady and Breathe use their own color.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -77,6 +77,7 @@ struct DPISettingsView: View {
 
 struct LightSettingsView: View {
     @EnvironmentObject private var store: DeviceStore
+    @State private var showingCaptureImporter = false
 
     var body: some View {
         Form {
@@ -85,14 +86,32 @@ struct LightSettingsView: View {
                     Text(mode.rawValue).tag(mode)
                 }
             }
-            LabeledContent("Brightness") { Slider(value: $store.lightBrightness, in: 0...100) }
-            LabeledContent("Speed") { Slider(value: $store.lightSpeed, in: 0...100) }
+            LabeledContent("Brightness") {
+                Slider(value: $store.lightBrightness, in: store.connection == .wireless8K ? 12.5...100 : 0...100,
+                       step: store.connection == .wireless8K ? 12.5 : 1)
+            }
+            LabeledContent("Speed") {
+                Slider(value: $store.lightSpeed, in: store.connection == .wireless8K ? 12.5...100 : 0...100,
+                       step: store.connection == .wireless8K ? 12.5 : 1)
+            }
             ColorPicker("Color", selection: $store.lightColor)
-            Text("Wheel LED effects are OEM-extended. If Apply does not change the mouse, use DPI tab colors (those are confirmed on SC680).")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            if store.connection == .wireless8K {
+                Button("Import Windows Lighting Capture…") { showingCaptureImporter = true }
+                Text(store.oemParameters == nil
+                    ? "Import sc680_hid_capture.log once before Apply. This preserves the mouse attributes shared with lighting."
+                    : "Windows lighting baseline loaded. Steady and Breathe use this color; DPI modes use the stage colors.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
         }
         .formStyle(.grouped)
+        .fileImporter(isPresented: $showingCaptureImporter,
+                      allowedContentTypes: [.plainText, UTType(filenameExtension: "log") ?? .plainText]) { result in
+            guard case .success(let url) = result else { return }
+            let scoped = url.startAccessingSecurityScopedResource()
+            defer { if scoped { url.stopAccessingSecurityScopedResource() } }
+            do { try store.importLightingCapture(from: url) }
+            catch { store.statusText = error.localizedDescription }
+        }
     }
 }
 

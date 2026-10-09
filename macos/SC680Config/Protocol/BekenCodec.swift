@@ -170,6 +170,84 @@ enum BekenCodec {
         return (Int(data[5]) * 2, (data[10] & 0x02) != 0, (data[10] & 0x04) != 0, (data[10] & 0x08) != 0)
     }
 
+    /// OEM Mouse.exe 0x4158B3..0x4159AD, verified against Windows Apply capture.
+    /// Preserve the shared packet's other mouse attributes when editing lighting.
+    static func validOEMParameters(_ packet: Data) -> Bool {
+        packet.count == 15 && packet[0] == paramReportID && packet[1] == paramCommand &&
+        packet[2] == 1 && checksum(packet, from: 3, through: 10, at: 11) &&
+        packet[13] == 0 && packet[14] == 0
+    }
+
+    static func encodeOEMLight(preserving original: Data, mode: UInt8, brightness: Int, speed: Int,
+                               red: UInt8, green: UInt8, blue: UInt8) throws -> Data {
+        guard validOEMParameters(original), mode <= 6, (1...8).contains(brightness), (1...8).contains(speed) else {
+            throw HIDTransportError.reportFailed("Import a valid Windows capture before changing 8K lighting")
+        }
+        var packet = [UInt8](original)
+        packet[3] = mode << 4
+        packet[4] = (packet[4] & 0xF0) | UInt8(9 - speed)
+        packet[5] = (packet[5] & 0xF0) | UInt8(mode == 1 || mode == 5 ? brightness : 8)
+        packet[6] = red; packet[7] = green; packet[8] = blue
+        let sum = packet[3...10].reduce(UInt16(0)) { $0 &+ UInt16($1) }
+        packet[11] = UInt8(sum >> 8); packet[12] = UInt8(sum & 0xFF)
+        return Data(packet)
+    }
+
+    /// Successful TX calls from our proxy; malformed, incomplete and failed writes are excluded.
+    static func packets(fromCapture text: String) throws -> [Data] {
+        guard text.contains("Set_VIDPID(1D57, FA65)") else {
+            throw HIDTransportError.reportFailed("The log is not an SC680 8K receiver capture")
+        }
+        var pending: Data?
+        var result: [Data] = []
+        for line in text.components(separatedBy: .newlines) {
+            if let range = line.range(of: "TX[65]: ") {
+                let tokens = line[range.upperBound...].split(separator: " ")
+                let bytes = tokens.compactMap { UInt8($0, radix: 16) }
+                guard tokens.count == 65, bytes.count == 65, bytes[64] == 0,
+                      is8KOutputEnvelope(Data(bytes.prefix(64))) else {
+                    throw HIDTransportError.reportFailed("Invalid output frame in capture")
+                }
+                pending = Data(bytes[3..<(Int(bytes[1]) - 2)])
+            } else if line.contains("WriteUSB =>") {
+                if line.hasSuffix("WriteUSB => 1"), let packet = pending { result.append(packet) }
+                pending = nil
+            }
+        }
+        return result
+    }
+
+    static func oemParameters(fromCapture text: String) throws -> Data {
+        guard let packet = try packets(fromCapture: text).last(where: validOEMParameters),
+              packet[3] & 0x0F == 0, packet[3] >> 4 <= 6,
+              (1...8).contains(Int(packet[4] & 0x0F)), (1...8).contains(Int(packet[5] & 0x0F)) else {
+            throw HIDTransportError.reportFailed("No supported successful lighting configuration in capture")
+        }
+        return packet
+    }
+
+    static func validOEMDPI(_ packet: Data) -> Bool {
+        packet.count == 56 && decodeDPI(packet) != nil && packet[49] == 1 &&
+        [3, 4, 6, 7].allSatisfy { packet[$0] <= 1 } && packet.suffix(4).allSatisfy { $0 == 0 }
+    }
+
+    static func encodeOEMDPI(_ generic: Data, preserving original: Data? = nil) throws -> Data {
+        guard generic.count == 52, decodeDPI(generic) != nil,
+              original == nil || validOEMDPI(original!) else {
+            throw HIDTransportError.reportFailed("Invalid OEM DPI configuration")
+        }
+        var inner = [UInt8](generic)
+        // OEM fields are LOD, ripple control, angle snap, and motion sync, not DPI high-range masks.
+        // Defaults from Mouse.exe 0x417370; imported capture preserves existing firmware settings.
+        let defaults: [Int: UInt8] = [3: 0, 4: 0, 6: 0, 7: 1]
+        for index in [3, 4, 6, 7] { inner[index] = original?[index] ?? defaults[index]! }
+        inner[49] = 1
+        let sum = inner[3...49].reduce(UInt16(0)) { $0 &+ UInt16($1) }
+        inner[50] = UInt8(sum >> 8); inner[51] = UInt8(sum & 0xFF)
+        inner += [0, 0, 0, 0]
+        return Data(inner)
+    }
+
     // MARK: - Buttons
 
     /// Shared mapping for the six physical buttons. Wheel click is Middle, not a seventh button.
@@ -328,14 +406,8 @@ enum BekenCodec {
         var inner = [UInt8](packet)
         switch packet.first {
         case dpiReportID:
-            guard packet.count == 52, decodeDPI(packet) != nil else {
-                throw HIDTransportError.reportFailed("unconfirmed 8K light/DPI command")
-            }
-            // Mouse.exe 0x415DD7 sets indication=1; 0x415E6E sends 0x38 bytes.
-            inner[49] = 1
-            let sum = inner[3...49].reduce(UInt16(0)) { $0 &+ UInt16($1) }
-            inner[50] = UInt8(sum >> 8); inner[51] = UInt8(sum & 0xFF)
-            inner += [0, 0, 0, 0]
+            if validOEMDPI(packet) { inner = [UInt8](packet) }
+            else { inner = [UInt8](try encodeOEMDPI(packet)) }
         case rateReportID:
             guard packet.count == 9, let hz = decodeRate(packet) else {
                 throw HIDTransportError.reportFailed("invalid polling command")
@@ -345,6 +417,10 @@ enum BekenCodec {
                 1000: 0x04, 2000: 0x02, 4000: 0x01, 8000: 0x40]
             guard let code = codes[hz] else { throw HIDTransportError.reportFailed("unsupported polling rate") }
             inner[3] = code; inner[4] = ~code
+        case paramReportID:
+            guard validOEMParameters(packet) else {
+                throw HIDTransportError.reportFailed("invalid OEM shared lighting/attribute command")
+            }
         case buttonReportID:
             guard decodeButtons(packet) != nil else { throw HIDTransportError.reportFailed("invalid button command") }
             // OEM sends exactly 59 bytes; remaining generic bytes are padding.
