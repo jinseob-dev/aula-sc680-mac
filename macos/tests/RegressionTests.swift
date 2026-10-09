@@ -146,6 +146,50 @@ struct RegressionTests {
             do { _ = try BekenCodec.encode8KConfiguration(unsupported) } catch { rejected = true }
             try check(rejected, "Reject unconfirmed commands before transport")
         }
+        // Independent full Windows captures: a static blue -> custom-color Apply.
+        func hexFixture(_ name: String) throws -> Data {
+            let text = try String(contentsOfFile: "docs/fixtures/\(name).hex")
+            return Data(text.split(whereSeparator: { $0.isWhitespace }).compactMap { UInt8($0, radix: 16) })
+        }
+        let actualDPI = try hexFixture("oem_8k_dpi_captured")
+        let actualInner = Data(actualDPI[3..<59])
+        let actualSlots = BekenCodec.decodeDPI(actualInner)!
+        let regeneratedDPI = try BekenCodec.encode8KConfiguration(BekenCodec.encodeDPI(
+            slots: actualSlots.slots, activeIndex: actualSlots.activeIndex, colors: actualSlots.colors, enabledMask: actualSlots.enabledMask))
+        try check(regeneratedDPI == actualDPI, "Match actual captured high-DPI frame; use control bits rather than high-range masks")
+        let blueLight = try hexFixture("oem_8k_light_steady_blue")
+        let customLight = try hexFixture("oem_8k_light_steady_custom")
+        let baseline = Data(blueLight[3..<18])
+        let changedLight = try BekenCodec.encodeOEMLight(preserving: baseline, mode: 1, brightness: 8, speed: 6,
+                                                        red: 0x48, green: 0xB1, blue: 0xFF)
+        let changedOutput = try BekenCodec.encode8KConfiguration(changedLight)
+        try check(changedOutput == customLight,
+                  "Match captured Windows color Apply byte-for-byte")
+        try check(changedLight[9...10] == baseline[9...10] &&
+                  changedLight[4] & 0xF0 == baseline[4] & 0xF0 && changedLight[5] & 0xF0 == baseline[5] & 0xF0,
+                  "Lighting does not overwrite shared mouse attributes")
+        let breatheLight = try BekenCodec.encodeOEMLight(preserving: baseline, mode: 2, brightness: 3, speed: 6,
+                                                        red: 0, green: 0, blue: 255)
+        try check(breatheLight[3] == 0x20 && breatheLight[5] == 0xA8, "OEM breathing fixes brightness nibble to eight")
+        let captureText = "Set_VIDPID(1D57, FA65)\nTX[65]: " + (Array(blueLight) + [0]).map { String(format: "%02X", $0) }.joined(separator: " ") + "\nWriteUSB => 1\n"
+        let captureURL = root.appendingPathComponent("lighting.log")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        try captureText.write(to: captureURL, atomically: true, encoding: .utf8)
+        let importedSession = MockSession()
+        let importedStore = makeStore(importedSession)
+        try importedStore.importLightingCapture(from: captureURL)
+        try check(importedSession.writes.isEmpty, "Importing capture makes no USB writes")
+        await importedStore.applyOnly(.light)
+        try check(importedSession.writes == [baseline], "Apply imported blue lighting reproduces OEM packet")
+        let importedExport = root.appendingPathComponent("lighting-profile.json")
+        try importedStore.exportActiveProfile(to: importedExport)
+        let restoredStore = makeStore(MockSession())
+        try restoredStore.importProfile(from: importedExport)
+        try check(restoredStore.oemParameters == baseline, "Persist baseline across profile export/import")
+        var invalidCaptureRejected = false
+        do { _ = try BekenCodec.oemParameters(fromCapture: captureText.replacingOccurrences(of: "WriteUSB => 1", with: "WriteUSB => 0")) }
+        catch { invalidCaptureRejected = true }
+        try check(invalidCaptureRejected, "Failed Windows write is not a lighting baseline")
         var oversizedRejected = false
         do { _ = try BekenCodec.wrapFor8KOutput(Data(repeating: 1, count: 60)) } catch { oversizedRejected = true }
         try check(oversizedRejected, "Never silently truncate an oversized command")

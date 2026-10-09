@@ -111,6 +111,8 @@ struct MouseProfile: Identifiable, Equatable, Codable {
     var rippleControl: Bool
     var angleSnap: Bool
     var motionSync: Bool
+    var oemParameters: Data? = nil
+    var oemDPI: Data? = nil
 
     /// Reject malformed profiles before they reach UI bindings or HID encoders.
     func validated() throws -> MouseProfile {
@@ -145,6 +147,10 @@ struct MouseProfile: Identifiable, Equatable, Codable {
         try require(lodMM == 1 || lodMM == 2, "LOD must be 1 or 2 mm")
         try require(debounceMs.isFinite && (2...40).contains(debounceMs) && debounceMs.truncatingRemainder(dividingBy: 2) == 0,
                     "Debounce must be 2–40 ms in steps of 2")
+        if let oemParameters {
+            try require(BekenCodec.validOEMParameters(oemParameters), "Invalid OEM lighting/attribute baseline")
+        }
+        if let oemDPI { try require(BekenCodec.validOEMDPI(oemDPI), "Invalid OEM DPI baseline") }
         var result = self
         // Older exports included a duplicate Scroll binding for the Middle hardware slot.
         result.buttons = Array(buttons.prefix(6))
@@ -201,6 +207,8 @@ final class DeviceStore: ObservableObject {
     @Published private(set) var isBusy = false
     private let session: DeviceSession
     private var rawButtons: Data?
+    @Published private(set) var oemParameters: Data?
+    private var oemDPI: Data?
     private var syncMissing: [String]?
     private let profilesURL: URL
     private let macrosURL: URL
@@ -354,8 +362,10 @@ final class DeviceStore: ObservableObject {
                 notices.append("Receiver acceptance requires readback or a hardware check")
             }
             for section in sections {
-                if info.identity == SC680DeviceIDs.dongle8K && (section == .parameters || section == .light) {
-                    notices.append("\(section.rawValue) skipped: device application is not supported on this 8K receiver yet")
+                if info.identity == SC680DeviceIDs.dongle8K && (section == .parameters || (section == .light && oemParameters == nil)) {
+                    notices.append(section == .light
+                        ? "Light skipped: import Windows lighting capture first"
+                        : "\(section.rawValue) skipped: device application is not supported on this 8K receiver yet")
                     continue
                 }
                 if sections.count > 1, section == .buttons, rawButtons == nil {
@@ -395,7 +405,8 @@ final class DeviceStore: ObservableObject {
         let values = dpiSlots.map(\.dpi)
         let colors = dpiSlots.map { (UInt8(($0.red * 255).rounded()), UInt8(($0.green * 255).rounded()), UInt8(($0.blue * 255).rounded())) }
         let mask = dpiSlots.enumerated().reduce(UInt8(0)) { $1.element.enabled ? $0 | (1 << $1.offset) : $0 }
-        let packet = BekenCodec.encodeDPI(slots: values, activeIndex: activeDPIIndex, colors: colors, enabledMask: mask)
+        var packet = BekenCodec.encodeDPI(slots: values, activeIndex: activeDPIIndex, colors: colors, enabledMask: mask)
+        if connection == .wireless8K { packet = try BekenCodec.encodeOEMDPI(packet, preserving: oemDPI) }
         try await session.send(packet, outputOnly: false)
         let commitNotice = await sendApplyCommit()
         guard let raw = try? await session.read(reportID: BekenCodec.dpiReportID, length: 52),
@@ -457,6 +468,20 @@ final class DeviceStore: ObservableObject {
 
     private func applyLight() async throws -> String? {
         let rgb = NSColor(lightColor).usingColorSpace(.deviceRGB)
+        if connection == .wireless8K {
+            guard let original = oemParameters else {
+                throw HIDTransportError.reportFailed("Import a Windows capture in Light before Apply")
+            }
+            let packet = try BekenCodec.encodeOEMLight(preserving: original, mode: lightMode.oemCode,
+                brightness: max(1, min(8, Int((lightBrightness * 8 / 100).rounded()))),
+                speed: max(1, min(8, Int((lightSpeed * 8 / 100).rounded()))),
+                red: UInt8(clamping: Int(((rgb?.redComponent ?? 1) * 255).rounded())),
+                green: UInt8(clamping: Int(((rgb?.greenComponent ?? 0) * 255).rounded())),
+                blue: UInt8(clamping: Int(((rgb?.blueComponent ?? 0) * 255).rounded())))
+            try await session.send(packet, outputOnly: false)
+            oemParameters = packet
+            return "Lighting sent using the Windows OEM command; hardware effect needs confirmation"
+        }
         let frames = BekenCodec.encodeLightFrames(mode: lightMode.oemCode,
             brightness: UInt8(lightBrightness), speed: UInt8(lightSpeed),
             red: UInt8(clamping: Int(((rgb?.redComponent ?? 1) * 255).rounded())),
@@ -506,6 +531,8 @@ final class DeviceStore: ObservableObject {
         pollingRate = 1000
         buttons = Self.defaultButtons()
         lightMode = .off
+        oemParameters = nil
+        oemDPI = nil
         debounceMs = 8
         angleSnap = false
         rippleControl = false
@@ -537,6 +564,19 @@ final class DeviceStore: ObservableObject {
         activeProfileIndex = profileDocs.count - 1
         loadProfile(at: activeProfileIndex)
         saveLocalState()
+    }
+
+    func importLightingCapture(from url: URL) throws {
+        let text = try String(contentsOf: url, encoding: .utf8)
+        let packet = try BekenCodec.oemParameters(fromCapture: text)
+        oemParameters = packet
+        oemDPI = try BekenCodec.packets(fromCapture: text).last(where: BekenCodec.validOEMDPI)
+        lightMode = LightMode.from(oemCode: packet[3] >> 4)
+        lightBrightness = Double(packet[5] & 0x0F) * 100 / 8
+        lightSpeed = Double(9 - (packet[4] & 0x0F)) * 100 / 8
+        lightColor = Color(red: Double(packet[6]) / 255, green: Double(packet[7]) / 255, blue: Double(packet[8]) / 255)
+        persistActiveProfile()
+        statusText = "Windows lighting settings imported locally; click Apply Light to send changes"
     }
 
     func addMacro() {
@@ -572,7 +612,9 @@ final class DeviceStore: ObservableObject {
             debounceMs: debounceMs,
             rippleControl: rippleControl,
             angleSnap: angleSnap,
-            motionSync: motionSync
+            motionSync: motionSync,
+            oemParameters: oemParameters,
+            oemDPI: oemDPI
         )
     }
 
@@ -591,6 +633,8 @@ final class DeviceStore: ObservableObject {
         activeDPIIndex = p.activeDPIIndex
         pollingRate = p.pollingRate
         buttons = p.buttons
+        oemParameters = p.oemParameters
+        oemDPI = p.oemDPI
         lightMode = LightMode(rawValue: p.lightMode) ?? .off
         lightBrightness = p.lightBrightness
         lightSpeed = p.lightSpeed
