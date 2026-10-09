@@ -58,18 +58,15 @@ struct DPISettingsView: View {
                             set: { slot.color = $0 }
                         )).labelsHidden()
                         if store.activeDPIIndex == slot.id {
-                            Text("Active").foregroundStyle(.secondary)
+                            Text("Selected").foregroundStyle(.secondary).frame(width: 60)
                         } else {
-                            Button("Use") { store.activeDPIIndex = slot.id }
+                            Button("Select") { store.activeDPIIndex = slot.id }.frame(width: 60)
                         }
                     }
                 }
             }
             Section {
-                Button("Apply DPI") {
-                    Task { await store.applyOnly(.dpi) }
-                }
-                Text("Apply checks the device response. If readback is unavailable or differs, the status shows that verification failed.")
+                Text("Use Apply DPI above to send these stages. The status indicates whether the device settings could be verified.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -91,9 +88,6 @@ struct LightSettingsView: View {
             LabeledContent("Brightness") { Slider(value: $store.lightBrightness, in: 0...100) }
             LabeledContent("Speed") { Slider(value: $store.lightSpeed, in: 0...100) }
             ColorPicker("Color", selection: $store.lightColor)
-            Button("Apply Light") {
-                Task { await store.applyOnly(.light) }
-            }
             Text("Wheel LED effects are OEM-extended. If Apply does not change the mouse, use DPI tab colors (those are confirmed on SC680).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -113,9 +107,6 @@ struct PollingSettingsView: View {
                 }
             }
             .pickerStyle(.radioGroup)
-            Button("Apply Polling Rate") {
-                Task { await store.applyOnly(.polling) }
-            }
         }
         .formStyle(.grouped)
     }
@@ -139,9 +130,6 @@ struct PerformanceSettingsView: View {
             Toggle("Ripple Control", isOn: $store.rippleControl)
             Toggle("Angle Snapping", isOn: $store.angleSnap)
             Toggle("Motion Sync", isOn: $store.motionSync)
-            Button("Apply Attributes") {
-                Task { await store.applyOnly(.parameters) }
-            }
         }
         .formStyle(.grouped)
     }

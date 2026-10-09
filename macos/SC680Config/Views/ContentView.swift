@@ -5,8 +5,11 @@ struct ContentView: View {
     @EnvironmentObject private var store: DeviceStore
     @State private var tab: SidebarTab = .buttons
 
-    init(initialTab: SidebarTab = .buttons) {
+    private let onLayout: (([ContentLayoutRegion: CGRect]) -> Void)?
+
+    init(initialTab: SidebarTab = .buttons, onLayout: (([ContentLayoutRegion: CGRect]) -> Void)? = nil) {
         _tab = State(initialValue: initialTab)
+        self.onLayout = onLayout
     }
 
     private var selection: Binding<SidebarTab?> {
@@ -14,13 +17,13 @@ struct ContentView: View {
     }
 
     var body: some View {
-        HSplitView {
-            List(SidebarTab.allCases, selection: selection) { item in
-                Label(item.title, systemImage: item.icon)
-                    .tag(item)
-            }
-            .frame(minWidth: 200, idealWidth: 220, maxWidth: 280)
-            .safeAreaInset(edge: .bottom) {
+        HStack(spacing: 0) {
+            VStack(spacing: 0) {
+                List(SidebarTab.allCases, selection: selection) { item in
+                    Label(item.title, systemImage: item.icon).tag(item)
+                }
+                .listStyle(.sidebar)
+                Divider()
                 VStack(alignment: .leading, spacing: 8) {
                     Text(store.connection.rawValue)
                         .font(.headline)
@@ -47,6 +50,10 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
             }
+            .frame(width: 220)
+            .frame(maxHeight: .infinity)
+            .recordLayout(.sidebar)
+            Divider()
             VStack(spacing: 0) {
                 header
                 Divider()
@@ -70,7 +77,10 @@ struct ContentView: View {
                 .padding()
             }
             .frame(minWidth: 680, maxWidth: .infinity, maxHeight: .infinity)
+            .recordLayout(.detail)
         }
+        .coordinateSpace(name: "content-layout")
+        .onPreferenceChange(ContentLayoutKey.self) { onLayout?($0) }
         .task {
             // One-shot connect on first appear; avoid re-opening on every view refresh.
             if store.connection == .none {
@@ -93,13 +103,20 @@ struct ContentView: View {
                     .help(store.statusText)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
-            .layoutPriority(1)
-            Button(store.isBusy ? "Working…" : tab.settingsSection.map { "Apply \($0.rawValue)" } ?? "Apply") {
-                if let section = tab.settingsSection { Task { await store.applyOnly(section) } }
-            }
-                .disabled(store.isBusy || tab.settingsSection == nil)
+            if let section = tab.settingsSection {
+                Button {
+                    Task { await store.applyOnly(section) }
+                } label: {
+                    Text(store.isBusy ? "Working…" : "Apply \(section.rawValue)")
+                        .frame(minWidth: 104)
+                }
+                .disabled(store.isBusy)
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
+                .fixedSize()
+                .layoutPriority(2)
+                .recordLayout(.applyButton)
+            }
         }
         .padding()
         .frame(maxHeight: 120)
@@ -145,5 +162,24 @@ enum SidebarTab: String, CaseIterable, Identifiable {
         case .macros: return "recordingtape"
         case .profiles: return "square.stack.3d.up"
         }
+    }
+}
+
+// Measure rendered regions for layout regression checks at different window sizes.
+enum ContentLayoutRegion: Hashable { case sidebar, detail, applyButton }
+
+private struct ContentLayoutKey: PreferenceKey {
+    static var defaultValue: [ContentLayoutRegion: CGRect] = [:]
+    static func reduce(value: inout [ContentLayoutRegion: CGRect], nextValue: () -> [ContentLayoutRegion: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, new in new })
+    }
+}
+
+private extension View {
+    func recordLayout(_ region: ContentLayoutRegion) -> some View {
+        background(GeometryReader { geometry in
+            Color.clear.preference(key: ContentLayoutKey.self,
+                                   value: [region: geometry.frame(in: .named("content-layout"))])
+        })
     }
 }

@@ -11,13 +11,17 @@ final class UIOnlySession: DeviceSession {
     }
     func unlock() async throws -> Bool { false }
     func send(_ packet: Data, outputOnly: Bool) async throws {
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await Task.sleep(nanoseconds: 500_000_000)
         writes.append(packet)
     }
     func read(reportID: UInt8, length: Int) async throws -> Data {
         try await Task.sleep(nanoseconds: 50_000_000)
         throw HIDTransportError.reportFailed("readback unavailable")
     }
+}
+
+@MainActor final class LayoutMeasurements {
+    var frames: [ContentLayoutRegion: CGRect] = [:]
 }
 
 enum UICheckError: Error { case failed(String) }
@@ -30,7 +34,7 @@ struct UIRegressionTests {
         Task { @MainActor in
             do {
                 try await run()
-                print("PASS: DPI-only Apply, Apply All, and long status preserve rendered settings content")
+                print("PASS: Apply preserves content; sidebar and Apply button fit minimum, wide, and tall windows")
                 exit(0)
             } catch {
                 FileHandle.standardError.write(Data("UI regression failed: \(error)\n".utf8))
@@ -46,27 +50,38 @@ struct UIRegressionTests {
         let session = UIOnlySession()
         let store = DeviceStore(session: session, storageDirectory: temp)
         await store.refreshConnection()
-        let host = NSHostingView(rootView: ContentView(initialTab: .dpi).environmentObject(store))
+        let layout = LayoutMeasurements()
+        let host = NSHostingView(rootView: ContentView(initialTab: .dpi, onLayout: { layout.frames = $0 }).environmentObject(store))
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 680),
                               styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
         window.isReleasedWhenClosed = false
         window.contentView = host
         window.orderFront(nil)
         defer { window.close() }
-        try await checkRendered(host, name: "before")
+        try await checkRendered(host, layout: layout, name: "before")
         await store.applyOnly(.dpi)
         guard session.writes.map({ $0[0] }) == [4] else { throw UICheckError.failed("DPI Apply wrote another section") }
-        try await checkRendered(host, name: "after-dpi")
+        try await checkRendered(host, layout: layout, name: "after-dpi")
         await store.applyAll()
-        try await checkRendered(host, name: "after-all")
+        try await checkRendered(host, layout: layout, name: "after-all")
         store.statusText = String(repeating: "Long readback and unsupported-settings warning. ", count: 100)
-        try await checkRendered(host, name: "long-status")
+        try await checkRendered(host, layout: layout, name: "long-status")
+        for size in [NSSize(width: 1440, height: 900), NSSize(width: 1500, height: 1660)] {
+            window.setContentSize(size)
+            try await checkRendered(host, layout: layout, name: "resized-\(Int(size.width))-\(Int(size.height))")
+        }
+        window.setContentSize(NSSize(width: 980, height: 680))
+        let apply = Task { await store.applyOnly(.dpi) }
+        try await checkRendered(host, layout: layout, name: "during-apply")
+        guard store.isBusy else { throw UICheckError.failed("Busy layout was not exercised") }
+        await apply.value
+        try await checkRendered(host, layout: layout, name: "after-resize-apply")
         guard SidebarTab.dpi.settingsSection == .dpi,
               SidebarTab.polling.settingsSection == .polling,
               SidebarTab.profiles.settingsSection == nil else { throw UICheckError.failed("Page routing") }
     }
 
-    @MainActor static func checkRendered<V: View>(_ host: NSHostingView<V>, name: String) async throws {
+    @MainActor static func checkRendered<V: View>(_ host: NSHostingView<V>, layout: LayoutMeasurements, name: String) async throws {
         try await Task.sleep(nanoseconds: 250_000_000)
         host.layoutSubtreeIfNeeded()
         host.displayIfNeeded()
@@ -78,6 +93,20 @@ struct UIRegressionTests {
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         if let png = image.representation(using: .png, properties: [:]) {
             try png.write(to: directory.appendingPathComponent("\(name).png"))
+        }
+        guard let sidebar = layout.frames[.sidebar], let detail = layout.frames[.detail],
+              let button = layout.frames[.applyButton] else {
+            throw UICheckError.failed("Missing measured regions for \(name)")
+        }
+        guard abs(sidebar.minX) < 2, abs(sidebar.width - 220) < 2,
+              abs(detail.minX - sidebar.maxX) < 3,
+              abs(detail.maxX - host.bounds.width) < 3 else {
+            throw UICheckError.failed("Misaligned sidebar/detail for \(name): \(layout.frames)")
+        }
+        guard button.width >= 80, button.height >= 24,
+              button.minX > detail.minX, button.maxX <= detail.maxX,
+              button.minY >= 0, button.maxY <= 120 else {
+            throw UICheckError.failed("Apply button clipped or compressed for \(name): \(button)")
         }
         // Sample the middle of the detail pane, excluding the sidebar and header.
         // A blank background cannot satisfy this check through title/sidebar pixels.
