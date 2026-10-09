@@ -32,6 +32,15 @@ enum LightMode: String, CaseIterable, Identifiable {
         }
     }
 
+    // Color-based effects always use the receiver's DPI-linked modes.
+    var dpiLinkedCode: UInt8 {
+        switch self {
+        case .steady, .dpiSteady: return 5
+        case .breathe, .dpiBreathe: return 6
+        default: return oemCode
+        }
+    }
+
     static func from(oemCode: UInt8) -> LightMode {
         LightMode.allCases.first { $0.oemCode == oemCode } ?? .off
     }
@@ -431,6 +440,11 @@ final class DeviceStore: ObservableObject {
         if connection == .wireless8K { packet = try BekenCodec.encodeOEMDPI(packet, preserving: oemDPI) }
         try await session.send(packet, outputOnly: false)
         pendingDPISelection = false
+        // Refresh the live effect as well as the stored stage table.
+        if connection == .wireless8K, oemParameters != nil {
+            do { _ = try await applyLight(stageIndex: activeDPIIndex) }
+            catch { return "DPI sent; lighting refresh failed: \(error.localizedDescription)" }
+        }
         let commitNotice = await sendApplyCommit()
         guard let raw = try? await session.read(reportID: BekenCodec.dpiReportID, length: 52),
               let decoded = BekenCodec.decodeDPI(raw) else { return "DPI readback unavailable; application unverified" }
@@ -489,13 +503,15 @@ final class DeviceStore: ObservableObject {
         return Data(raw[3...56]) == Data(packet[3...56]) ? nil : "Buttons readback differs from the requested mapping"
     }
 
-    private func applyLight() async throws -> String? {
-        let rgb = NSColor(lightColor).usingColorSpace(.deviceRGB)
+    private func applyLight(stageIndex: Int? = nil) async throws -> String? {
+        let index = stageIndex ?? deviceDPIIndex ?? activeDPIIndex
+        let slot = dpiSlots[index]
+        let rgb = NSColor(slot.color).usingColorSpace(.deviceRGB)
         if connection == .wireless8K {
             guard let original = oemParameters else {
                 throw HIDTransportError.reportFailed("Import a Windows capture in Light before Apply")
             }
-            let packet = try BekenCodec.encodeOEMLight(preserving: original, mode: lightMode.oemCode,
+            let packet = try BekenCodec.encodeOEMLight(preserving: original, mode: lightMode.dpiLinkedCode,
                 brightness: max(1, min(8, Int((lightBrightness * 8 / 100).rounded()))),
                 speed: max(1, min(8, Int((lightSpeed * 8 / 100).rounded()))),
                 red: UInt8(clamping: Int(((rgb?.redComponent ?? 1) * 255).rounded())),
@@ -505,7 +521,7 @@ final class DeviceStore: ObservableObject {
             oemParameters = packet
             return "Lighting sent using the Windows OEM command; hardware effect needs confirmation"
         }
-        let frames = BekenCodec.encodeLightFrames(mode: lightMode.oemCode,
+        let frames = BekenCodec.encodeLightFrames(mode: lightMode.dpiLinkedCode,
             brightness: UInt8(lightBrightness), speed: UInt8(lightSpeed),
             red: UInt8(clamping: Int(((rgb?.redComponent ?? 1) * 255).rounded())),
             green: UInt8(clamping: Int(((rgb?.greenComponent ?? 0) * 255).rounded())),

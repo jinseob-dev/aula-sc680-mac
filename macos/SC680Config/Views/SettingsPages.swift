@@ -75,7 +75,7 @@ struct DPISettingsView: View {
                 }
             }
             Section {
-                Text("Use Apply DPI above to send these stages. Choose DPI Steady or DPI Breathe in Light to follow stage colors; Steady and Breathe use their own color.")
+                Text("Use Apply DPI above to send these stages. Lighting colors come from these DPI stages.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -90,8 +90,10 @@ struct LightSettingsView: View {
 
     var body: some View {
         Form {
-            Picker("Mode", selection: $store.lightMode) {
-                ForEach(LightMode.allCases) { mode in
+            Picker("Mode", selection: Binding(
+                get: { store.lightMode == .dpiSteady ? .steady : (store.lightMode == .dpiBreathe ? .breathe : store.lightMode) },
+                set: { store.lightMode = $0 })) {
+                ForEach([LightMode.off, .steady, .breathe, .neon, .cycleBreathe]) { mode in
                     Text(mode.rawValue).tag(mode)
                 }
             }
@@ -103,12 +105,13 @@ struct LightSettingsView: View {
                 Slider(value: $store.lightSpeed, in: store.connection == .wireless8K ? 12.5...100 : 0...100,
                        step: store.connection == .wireless8K ? 12.5 : 1)
             }
-            ColorPicker("Color", selection: $store.lightColor)
+            Text("Steady and Breathe follow DPI stage colors. Neon and Cycle Breathe use automatic color effects.")
+                .font(.caption).foregroundStyle(.secondary)
             if store.connection == .wireless8K {
                 Button("Import Windows Lighting Capture…") { showingCaptureImporter = true }
                 Text(store.oemParameters == nil
                     ? "Import sc680_hid_capture.log once before Apply. This preserves the mouse attributes shared with lighting."
-                    : "Windows lighting baseline loaded. Steady and Breathe use this color; DPI modes use the stage colors.")
+                    : "Windows lighting baseline loaded. Lighting colors follow the DPI stages.")
                     .font(.caption).foregroundStyle(.secondary)
             }
         }
