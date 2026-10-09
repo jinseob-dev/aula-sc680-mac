@@ -11,7 +11,7 @@ final class UIOnlySession: DeviceSession {
     }
     func unlock() async throws -> Bool { false }
     func send(_ packet: Data, outputOnly: Bool) async throws {
-        try await Task.sleep(nanoseconds: 100_000_000)
+        try await Task.sleep(nanoseconds: 500_000_000)
         writes.append(packet)
     }
     func read(reportID: UInt8, length: Int) async throws -> Data {
@@ -73,6 +73,7 @@ struct UIRegressionTests {
         window.setContentSize(NSSize(width: 980, height: 680))
         let apply = Task { await store.applyOnly(.dpi) }
         try await checkRendered(host, layout: layout, name: "during-apply")
+        guard store.isBusy else { throw UICheckError.failed("Busy layout was not exercised") }
         await apply.value
         try await checkRendered(host, layout: layout, name: "after-resize-apply")
         guard SidebarTab.dpi.settingsSection == .dpi,
