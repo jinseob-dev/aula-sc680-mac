@@ -218,12 +218,22 @@ struct RegressionTests {
         try importedStore.importLightingCapture(from: captureURL)
         try check(importedSession.writes.isEmpty, "Importing capture makes no USB writes")
         await importedStore.applyOnly(.light)
-        try check(importedSession.writes == [baseline], "Apply imported blue lighting reproduces OEM packet")
+        let stageLight = try BekenCodec.encodeOEMLight(preserving: baseline, mode: 5, brightness: 8, speed: 6,
+            red: 0, green: 255, blue: 0)
+        try check(importedSession.writes == [stageLight], "Steady uses the selected DPI color and firmware stage-following mode, not imported blue")
+        importedStore.lightMode = .breathe
+        await importedStore.applyOnly(.light)
+        try check(importedSession.writes.last?[3] == 0x60, "Breathe uses firmware stage-following mode")
+        importedStore.selectDPIStage(0)
+        await importedStore.applyOnly(.dpi)
+        let refreshed = importedSession.writes.last { $0.first == 0x05 }
+        try check(refreshed?[6] == 255 && refreshed?[7] == 0 && refreshed?[8] == 0,
+                  "Apply DPI refreshes the live stage color without stale blue")
         let importedExport = root.appendingPathComponent("lighting-profile.json")
         try importedStore.exportActiveProfile(to: importedExport)
         let restoredStore = makeStore(MockSession())
         try restoredStore.importProfile(from: importedExport)
-        try check(restoredStore.oemParameters == baseline, "Persist baseline across profile export/import")
+        try check(restoredStore.oemParameters == importedStore.oemParameters, "Persist baseline across profile export/import")
         var invalidCaptureRejected = false
         do { _ = try BekenCodec.oemParameters(fromCapture: captureText.replacingOccurrences(of: "WriteUSB => 1", with: "WriteUSB => 0")) }
         catch { invalidCaptureRejected = true }
