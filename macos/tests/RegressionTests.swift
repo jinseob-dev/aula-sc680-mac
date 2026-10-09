@@ -3,6 +3,7 @@ import IOKit
 
 final class MockSession: DeviceSession {
     var onDeviceRemoved: (() -> Void)?
+    var onDPIStageChanged: ((Int) -> Void)?
     var responses = [UInt8: Data]()
     var writes = [Data]()
     var echoWrites = true
@@ -51,6 +52,43 @@ struct RegressionTests {
             DeviceStore(session: session, storageDirectory: root.appendingPathComponent(UUID().uuidString))
         }
 
+        // Manufacturer event 0x1010 carries stage 1..8, not a DPI table.
+        try check(ReceiverDPIStage.decode(reportID: 3, data: Data([3, 0x10, 0x10, 4, 0])) == 3,
+                  "Decode DPI stage with report ID")
+        try check(ReceiverDPIStage.decode(reportID: 3, data: Data([0x10, 0x10, 8, 0])) == 7,
+                  "Decode payload-only DPI event")
+        for invalid in [Data([3, 0x10, 0x10, 0, 0]), Data([3, 0x10, 0x10, 9, 0]),
+                        Data([3, 0x10, 0x40, 1, 99]), Data([3, 0x10, 0x10, 1, 1])] {
+            try check(ReceiverDPIStage.decode(reportID: 3, data: invalid) == nil, "Reject unrelated/out-of-range stage event")
+        }
+        try check(ReceiverDPIStage.decode(reportID: 4, data: Data([3, 0x10, 0x10, 2, 0])) == nil,
+                  "Reject wrong physical report")
+        let stageSession = MockSession()
+        let stageStore = makeStore(stageSession)
+        await stageStore.refreshConnection()
+        stageStore.dpiSlots[0].dpi = 950
+        let draft = stageStore.dpiSlots
+        stageSession.onDPIStageChanged?(3)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try check(stageStore.deviceDPIIndex == 3 && stageStore.activeDPIIndex == 3,
+                  "Mouse DPI event updates device marker and selection")
+        try check(stageStore.dpiSlots == draft && stageSession.writes.isEmpty,
+                  "Passive synchronization preserves DPI/color drafts and sends no USB commands")
+        stageStore.selectDPIStage(1)
+        stageSession.onDPIStageChanged?(2)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try check(stageStore.deviceDPIIndex == 2 && stageStore.activeDPIIndex == 1,
+                  "Device marker tracks hardware without replacing an unapplied stage selection")
+        stageSession.onDPIStageChanged?(7)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try check(stageStore.deviceDPIIndex == 7 && !stageStore.dpiSlots[7].enabled,
+                  "Unknown hardware stage does not enable a local draft stage")
+        stageSession.onDeviceRemoved?()
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try check(stageStore.deviceDPIIndex == nil, "Disconnect clears observed stage")
+        stageSession.onDPIStageChanged?(1)
+        try await Task.sleep(nanoseconds: 20_000_000)
+        try check(stageStore.deviceDPIIndex == nil, "Ignore stage events while disconnected")
         // Compound HID receivers need not have a vendor PrimaryUsagePage.
         let compound = HIDInterfaceInfo(primaryUsagePage: 1, usagePages: [1, 0xFF00],
             outputReportIDs: [4], featureReportIDs: [0x80], maxOutputSize: 64, maxFeatureSize: 8)

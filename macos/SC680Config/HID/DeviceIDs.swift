@@ -83,6 +83,22 @@ struct ReceiverPowerState: Equatable {
     }
 }
 
+/// Mouse.exe 0x413A40: event 0x1010 reports a one-based DPI stage, not its numeric DPI.
+struct ReceiverDPIStage {
+    static func decode(reportID: Int, data: Data) -> Int? {
+        guard reportID == 3 else { return nil }
+        var bytes = Array(data)
+        if bytes.count == 5 {
+            guard bytes[0] == 3 else { return nil }
+            bytes.removeFirst()
+        }
+        guard bytes.count == 4, bytes[0] == 0x10, bytes[1] == 0x10 else { return nil }
+        let stage = Int(bytes[2]) | (Int(bytes[3]) << 8)
+        guard (1...8).contains(stage) else { return nil }
+        return stage - 1
+    }
+}
+
 /// Bounded, thread-safe inbox for vendor Input 0x04 responses. Pointer/keyboard
 /// reports are never retained. A write/open timestamp prevents stale verification.
 final class HIDResponseInbox {

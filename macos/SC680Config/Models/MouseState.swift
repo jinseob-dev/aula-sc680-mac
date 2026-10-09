@@ -184,6 +184,8 @@ final class DeviceStore: ObservableObject {
 
     @Published var dpiSlots: [DPISlot] = DeviceStore.defaultDPISlots()
     @Published var activeDPIIndex: Int = 1
+    @Published private(set) var deviceDPIIndex: Int?
+    private var pendingDPISelection = false
 
     @Published var pollingRate: Int = 1000
     let pollingRates = [125, 250, 500, 1000, 2000, 4000, 8000]
@@ -223,14 +225,32 @@ final class DeviceStore: ObservableObject {
         catch { statusText = "Local storage unavailable: \(error.localizedDescription)" }
         loadLocalState()
         if profileDocs.isEmpty { profileDocs = [snapshotProfile(name: "Profile 1")] }
+        pendingDPISelection = false
+        session.onDPIStageChanged = { [weak self] index in
+            Task { @MainActor in self?.receiveDPIStage(index) }
+        }
         session.onDeviceRemoved = { [weak self] in
             Task { @MainActor in
                 guard let self else { return }
                 self.rawButtons = nil
+                self.deviceDPIIndex = nil
                 guard !self.isBusy else { return }
                 self.markDisconnected(reason: "Receiver disconnected — reconnect and tap Rescan")
             }
         }
+    }
+
+    func selectDPIStage(_ index: Int) {
+        guard dpiSlots.indices.contains(index) else { return }
+        activeDPIIndex = index
+        pendingDPISelection = true
+    }
+
+    private func receiveDPIStage(_ index: Int) {
+        guard connection == .wireless8K, dpiSlots.indices.contains(index) else { return }
+        deviceDPIIndex = index
+        // Stage events have no numeric DPI or RGB values. Never overwrite those drafts.
+        if !pendingDPISelection && !isBusy && dpiSlots[index].enabled { activeDPIIndex = index }
     }
 
     func refreshConnection() async {
@@ -238,6 +258,7 @@ final class DeviceStore: ObservableObject {
         isBusy = true
         defer { isBusy = false }
         syncMissing = nil
+        deviceDPIIndex = nil
         statusText = "Connecting…"
         connectionDetails = ""
         do {
@@ -260,7 +281,7 @@ final class DeviceStore: ObservableObject {
     func copyConnectionDetails(context: String = "Device menu") async {
         await captureConnectionDetails()
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
-        let details = "SC680Config \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\n\(context)\nBusy: \(isBusy)\nStatus: \(statusText)\n\(connectionDetails)"
+        let details = "SC680Config \(version)\n\(ProcessInfo.processInfo.operatingSystemVersionString)\n\(context)\nBusy: \(isBusy)\nDevice DPI stage: \(deviceDPIIndex.map { String($0 + 1) } ?? "unknown")\nStatus: \(statusText)\n\(connectionDetails)"
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(details, forType: .string)
     }
@@ -288,6 +309,7 @@ final class DeviceStore: ObservableObject {
     private func markDisconnected(reason: String) {
         syncMissing = nil
         connection = .none
+        deviceDPIIndex = nil
         productName = ""
         batteryPercent = nil
         isCharging = false
@@ -408,6 +430,7 @@ final class DeviceStore: ObservableObject {
         var packet = BekenCodec.encodeDPI(slots: values, activeIndex: activeDPIIndex, colors: colors, enabledMask: mask)
         if connection == .wireless8K { packet = try BekenCodec.encodeOEMDPI(packet, preserving: oemDPI) }
         try await session.send(packet, outputOnly: false)
+        pendingDPISelection = false
         let commitNotice = await sendApplyCommit()
         guard let raw = try? await session.read(reportID: BekenCodec.dpiReportID, length: 52),
               let decoded = BekenCodec.decodeDPI(raw) else { return "DPI readback unavailable; application unverified" }
@@ -528,6 +551,7 @@ final class DeviceStore: ObservableObject {
     func resetActiveProfile() {
         dpiSlots = Self.defaultDPISlots()
         activeDPIIndex = 1
+        pendingDPISelection = true
         pollingRate = 1000
         buttons = Self.defaultButtons()
         lightMode = .off
@@ -631,6 +655,7 @@ final class DeviceStore: ObservableObject {
         let p = profileDocs[index]
         dpiSlots = p.dpiSlots
         activeDPIIndex = p.activeDPIIndex
+        pendingDPISelection = true
         pollingRate = p.pollingRate
         buttons = p.buttons
         oemParameters = p.oemParameters

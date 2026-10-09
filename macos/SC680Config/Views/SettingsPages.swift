@@ -43,6 +43,11 @@ struct DPISettingsView: View {
 
     var body: some View {
         Form {
+            if let index = store.deviceDPIIndex {
+                Text("Mouse: Stage \(index + 1)").font(.headline)
+            } else {
+                Text("Mouse stage: waiting for a DPI button event").foregroundStyle(.secondary)
+            }
             Section("DPI Stages") {
                 ForEach($store.dpiSlots) { $slot in
                     HStack {
@@ -57,10 +62,14 @@ struct DPISettingsView: View {
                             get: { slot.color },
                             set: { slot.color = $0 }
                         )).labelsHidden()
+                        if store.deviceDPIIndex == slot.id {
+                            Image(systemName: "computermouse.fill")
+                                .foregroundStyle(.blue).help("Current stage reported by the mouse")
+                        }
                         if store.activeDPIIndex == slot.id {
                             Text("Selected").foregroundStyle(.secondary).frame(width: 60)
                         } else {
-                            Button("Select") { store.activeDPIIndex = slot.id }.frame(width: 60)
+                            Button("Select") { store.selectDPIStage(slot.id) }.frame(width: 60)
                         }
                     }
                 }

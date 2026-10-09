@@ -12,6 +12,7 @@ struct HIDConnectionInfo {
 
 protocol DeviceSession: AnyObject {
     var onDeviceRemoved: (() -> Void)? { get set }
+    var onDPIStageChanged: ((Int) -> Void)? { get set }
     func open(forceReopen: Bool) async throws -> HIDConnectionInfo
     func unlock() async throws -> Bool
     func send(_ packet: Data, outputOnly: Bool) async throws
@@ -21,6 +22,7 @@ protocol DeviceSession: AnyObject {
 }
 
 extension DeviceSession {
+    var onDPIStageChanged: ((Int) -> Void)? { get { nil } set {} }
     func diagnostics() async -> String { "" }
     func receiverPower() async -> ReceiverPowerState? { nil }
 }
@@ -30,12 +32,14 @@ final class HIDClient: DeviceSession {
     private let queue: DispatchQueue
     private let transport: HIDTransport
     var onDeviceRemoved: (() -> Void)?
+    var onDPIStageChanged: ((Int) -> Void)?
 
     init() {
         let queue = DispatchQueue(label: "com.aula.sc680config.hid")
         self.queue = queue
         transport = HIDTransport(callbackQueue: queue)
         transport.onDeviceRemoved = { [weak self] in self?.onDeviceRemoved?() }
+        transport.onDPIStageChanged = { [weak self] index in self?.onDPIStageChanged?(index) }
     }
 
     private func perform<T>(_ work: @escaping () throws -> T) async throws -> T {
@@ -226,7 +230,11 @@ final class HIDTransport {
                 guard let context, result == kIOReturnSuccess, type == kIOHIDReportTypeInput,
                       (reportID == 3 || reportID == 4), length > 0, length <= 64 else { return }
                 let transport = Unmanaged<HIDTransport>.fromOpaque(context).takeUnretainedValue()
-                transport.responseInbox.record(reportID: Int(reportID), data: Data(bytes: report, count: length))
+                let data = Data(bytes: report, count: length)
+                transport.responseInbox.record(reportID: Int(reportID), data: data)
+                if let index = ReceiverDPIStage.decode(reportID: Int(reportID), data: data) {
+                    transport.onDPIStageChanged?(index)
+                }
             }, Unmanaged.passUnretained(self).toOpaque())
             IOHIDDeviceScheduleWithRunLoop(outputDevice, CFRunLoopGetMain(), CFRunLoopMode.defaultMode.rawValue)
         }
@@ -235,6 +243,7 @@ final class HIDTransport {
 
     /// Called on callbackQueue when one of the selected interfaces is removed.
     var onDeviceRemoved: (() -> Void)?
+    var onDPIStageChanged: ((Int) -> Void)?
 
     var isOpen: Bool { outputDevice != nil || featureDevice != nil }
 
