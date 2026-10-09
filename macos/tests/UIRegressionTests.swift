@@ -84,6 +84,15 @@ struct UIRegressionTests {
         try await Task.sleep(nanoseconds: 250_000_000)
         host.layoutSubtreeIfNeeded()
         host.displayIfNeeded()
+        guard let image = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
+            throw UICheckError.failed("No rendered bitmap for \(name)")
+        }
+        host.cacheDisplay(in: host.bounds, to: image)
+        let directory = URL(fileURLWithPath: "macos/build/ui-regressions", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        if let png = image.representation(using: .png, properties: [:]) {
+            try png.write(to: directory.appendingPathComponent("\(name).png"))
+        }
         guard let sidebar = layout.frames[.sidebar], let detail = layout.frames[.detail],
               let button = layout.frames[.applyButton] else {
             throw UICheckError.failed("Missing measured regions for \(name)")
@@ -97,15 +106,6 @@ struct UIRegressionTests {
               button.minX > detail.minX, button.maxX <= detail.maxX,
               button.minY >= 0, button.maxY <= 120 else {
             throw UICheckError.failed("Apply button clipped or compressed for \(name): \(button)")
-        }
-        guard let image = host.bitmapImageRepForCachingDisplay(in: host.bounds) else {
-            throw UICheckError.failed("No rendered bitmap for \(name)")
-        }
-        host.cacheDisplay(in: host.bounds, to: image)
-        let directory = URL(fileURLWithPath: "macos/build/ui-regressions", isDirectory: true)
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        if let png = image.representation(using: .png, properties: [:]) {
-            try png.write(to: directory.appendingPathComponent("\(name).png"))
         }
         // Sample the middle of the detail pane, excluding the sidebar and header.
         // A blank background cannot satisfy this check through title/sidebar pixels.

@@ -47,4 +47,4 @@ if (-not (Select-String -LiteralPath $log -SimpleMatch "WriteUSB len=" -Quiet)) 
 }
 Write-Host "Upload ONLY sc680_hid_capture.log and metadata.txt from: $output"
 Write-Host "The temporary OEM copy remains at: $destination (it can be deleted after the app exits)."
-Start-Process explorer.exe -ArgumentList $output
+Start-Process explorer.exe -ArgumentList ('"{0}"' -f $output)

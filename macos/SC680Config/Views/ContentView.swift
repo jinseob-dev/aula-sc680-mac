@@ -104,8 +104,11 @@ struct ContentView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if let section = tab.settingsSection {
-                Button(store.isBusy ? "Working…" : "Apply \(section.rawValue)") {
+                Button {
                     Task { await store.applyOnly(section) }
+                } label: {
+                    Text(store.isBusy ? "Working…" : "Apply \(section.rawValue)")
+                        .frame(minWidth: 104)
                 }
                 .disabled(store.isBusy)
                 .buttonStyle(.borderedProminent)
