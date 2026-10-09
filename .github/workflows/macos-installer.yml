@@ -95,8 +95,32 @@ jobs:
             macos/build/SHA256SUMS
           if-no-files-found: error
 
+  build-capture:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test 32-bit forwarding proxy
+        shell: cmd
+        run: tools\hid_proxy\build_capture.cmd
+      - name: Validate PowerShell and package capture tool
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $parseErrors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile("$PWD/tools/run_capture.ps1", [ref]$tokens, [ref]$parseErrors) | Out-Null
+          if ($parseErrors.Count) { throw ($parseErrors | Out-String) }
+          New-Item -ItemType Directory capture-package/hid_proxy | Out-Null
+          Copy-Item tools/capture-build/hiddriver_8k.dll capture-package/hid_proxy/
+          Copy-Item tools/run_capture.ps1,tools/capture.cmd,tools/hid_proxy/README.md capture-package/
+          Compress-Archive -Path capture-package/* -DestinationPath SC680-Windows-Capture.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SC680-Windows-Capture
+          path: SC680-Windows-Capture.zip
+          if-no-files-found: error
+
   publish:
-    needs: build-dmg
+    needs: [build-dmg, build-capture]
     if: >-
       (github.event_name == 'push' &&
        (github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))) ||
@@ -113,9 +137,16 @@ jobs:
           name: SC680Config-macos-arm64
           path: release-assets
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: SC680-Windows-Capture
+          path: release-assets
+
       - name: Verify uploaded checksums
         working-directory: release-assets
-        run: sha256sum -c SHA256SUMS
+        run: |
+          sha256sum -c SHA256SUMS
+          sha256sum SC680-Windows-Capture.zip >> SHA256SUMS
 
       - name: Publish GitHub release
         env:
@@ -136,11 +167,13 @@ jobs:
             gh release upload "$RELEASE_TAG" \
               "release-assets/$ARTIFACT_BASE.dmg" \
               "release-assets/$ARTIFACT_BASE.zip" \
+              release-assets/SC680-Windows-Capture.zip \
               release-assets/SHA256SUMS --clobber
           else
             gh release create "$RELEASE_TAG" \
               "release-assets/$ARTIFACT_BASE.dmg" \
               "release-assets/$ARTIFACT_BASE.zip" \
+              release-assets/SC680-Windows-Capture.zip \
               release-assets/SHA256SUMS \
               --target "$RELEASE_COMMIT" --title "$RELEASE_TAG" \
               --notes-file "$NOTES" --draft
